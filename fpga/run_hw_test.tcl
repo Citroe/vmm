@@ -1,7 +1,11 @@
-# Drives a full Vmm test over JTAG (weight-matrix load + activation vector +
-# capture) via the vio_0/ila_0 debug cores in fpga/vmm_debug.v, then decodes
-# and prints all 64 y lanes. Saves doing the 64-row weight load by hand
-# through the VIO GUI.
+# Drives a full VmmController test over JTAG (weight-matrix load + activation
+# vector + capture) via the vio_0/ila_0 debug cores in fpga/vmm_debug.v, then
+# decodes and prints all 32 y lanes. Saves doing the 32-row weight load by
+# hand through the VIO GUI.
+#
+# This drives VmmController's start/stream/start handshake, not the raw Vmm
+# core: pulse loadStart, feed 32 rows (one VIO toggle each), pulse
+# computeStart, trigger on `done`. The FSM does the per-cycle sequencing.
 #
 # NOT YET VALIDATED against a live device -- written from the vio_0/ila_0
 # CONFIG in fpga/create_debug_ip.tcl and the net names in fpga/vmm_debug.v,
@@ -20,51 +24,57 @@
 #
 # Usage, from the Hardware Manager Tcl console:
 #   source fpga/run_hw_test.tcl
-#   set W [lrepeat 64 [lrepeat 64 0]]       ;# 64x64 zero matrix to start
+#   set W [lrepeat 32 [lrepeat 32 0]]       ;# 32x32 zero matrix to start
 #   lset W 0 [lreplace [lindex $W 0] 0 0 5] ;# W[row 0][col 0] = 5
-#   set A [lrepeat 64 0]
+#   set A [lrepeat 32 0]
 #   lset A 0 3                              ;# a[0] = 3
 #   vmm_run $W $A                           ;# arms, drives, waits, prints y
 #
-# W: list of 64 rows, each a list of 64 signed ints in [-128, 127].
-# A: list of 64 signed ints in [-128, 127].
+# W: list of 32 rows, each a list of 32 signed ints in [-8, 7] (INT4).
+# A: list of 32 signed ints in [-8, 7] (INT4).
 
 # ---------------------------------------------------------------------
 # CONFIGURE: hw_vio/hw_ila probe names. These match the net names vio_0/
 # ila_0 are wired to in fpga/vmm_debug.v. If `get_hw_probes -of_objects
 # [get_hw_vios hw_vio_1]` (or the ila equivalent) shows different names on
-# your build, update these.
+# your build, update these. Vivado often appends a "_1" to ILA probe names.
 # ---------------------------------------------------------------------
 set VIO [get_hw_vios hw_vio_1]
 set ILA [get_hw_ilas hw_ila_1]
 
 array set VIO_PROBE {
-  weightLoad        vio_weightLoad
-  weightRow         vio_weightRow
-  weightRowData_lo  vio_weightRowData_lo
-  weightRowData_hi  vio_weightRowData_hi
-  a_lo              vio_a_lo
-  a_hi              vio_a_hi
-  aValid            vio_aValid
+  loadStart      vio_loadStart
+  weightRowData  vio_weightRowData
+  weightRowValid vio_weightRowValid
+  computeStart   vio_computeStart
+  a              vio_a
 }
-set ILA_PROBE_TRIGGER dut_yValid_1
-set ILA_PROBE_Y        dut_y
+# probe_in readbacks, for optional progress polling (see vmm_status).
+array set VIO_IN_PROBE {
+  weightRowReady dut_weightRowReady
+  busy           dut_busy
+  done           dut_done
+  error          dut_error
+}
+set ILA_PROBE_TRIGGER dut_done
+set ILA_PROBE_Y       dut_y
 
 # ---------------------------------------------------------------------
 # bit-twiddling helpers
 # ---------------------------------------------------------------------
 
-# Packs 32 signed 8-bit values (source indices $lo..$lo+31) into one
-# 256-bit hex string, with index $lo at the low byte -- matches how
-# vmm_debug.v reassembles vio_weightRowData/vio_a from the lo/hi halves.
-proc pack256 {values lo} {
+# Packs 32 signed 4-bit values (one full weight row or activation vector)
+# into one 128-bit hex string (32 hex nibbles), with index 0 at the
+# low nibble -- matches how vmm_debug.v wires vio_weightRowData/vio_a
+# straight into the DUT's per-lane ports.
+proc pack128 {values} {
   set word 0
   for {set i 31} {$i >= 0} {incr i -1} {
-    set v [lindex $values [expr {$lo + $i}]]
-    if {$v < 0} { set v [expr {$v + 256}] }
-    set word [expr {($word << 8) | $v}]
+    set v [lindex $values $i]
+    if {$v < 0} { set v [expr {$v + 16}] }
+    set word [expr {($word << 4) | ($v & 0xF)}]
   }
-  return [format "%064X" $word]
+  return [format "%032X" $word]
 }
 
 proc from_twos {uval bits} {
@@ -76,7 +86,7 @@ proc from_twos {uval bits} {
 }
 
 # ---------------------------------------------------------------------
-# VIO drive
+# VIO drive / readback
 # ---------------------------------------------------------------------
 proc vio_set {name value} {
   global VIO VIO_PROBE
@@ -85,30 +95,47 @@ proc vio_set {name value} {
   commit_hw_vio $p
 }
 
+# High->low toggle of a 1-bit VIO output. VmmController rising-edge-detects
+# loadStart/computeStart, and vmm_debug.v edge-detects weightRowValid, so
+# one toggle == one event regardless of how many fabric cycles elapse
+# between the two commits.
+proc vio_pulse {name} {
+  vio_set $name 1
+  vio_set $name 0
+}
+
+proc vmm_status {} {
+  global VIO VIO_IN_PROBE
+  refresh_hw_vio $VIO
+  foreach k {weightRowReady busy done error} {
+    set p [get_hw_probes "*$VIO_IN_PROBE($k)" -of_objects $VIO]
+    puts [format "  %-14s = %s" $k [get_property INPUT_VALUE $p]]
+  }
+}
+
 proc vmm_load_weights {W} {
-  for {set r 0} {$r < 64} {incr r} {
-    set row [lindex $W $r]
-    vio_set weightRow          [format "%02X" $r]
-    vio_set weightRowData_lo   [pack256 $row 0]
-    vio_set weightRowData_hi   [pack256 $row 32]
-    vio_set weightLoad "1"
-    vio_set weightLoad "0"
+  # One rising edge on loadStart -> FSM enters its load state and holds
+  # weightRow.ready high for the whole 32-row sequence.
+  vio_set weightRowValid 0
+  vio_pulse loadStart
+  for {set r 0} {$r < 32} {incr r} {
+    vio_set weightRowData [pack128 [lindex $W $r]]
+    # each toggle -> exactly one Decoupled beat -> one row, FSM auto-addresses
+    vio_pulse weightRowValid
   }
 }
 
 proc vmm_load_activation {A} {
-  vio_set a_lo    [pack256 $A 0]
-  vio_set a_hi    [pack256 $A 32]
-  vio_set aValid "1"
-  vio_set aValid "0"
+  vio_set a [pack128 $A]
+  vio_pulse computeStart
 }
 
 # ---------------------------------------------------------------------
 # ILA arm / capture / decode
 # ---------------------------------------------------------------------
 
-# Arm before driving stimulus -- yValid is a single-cycle pulse, so the
-# ILA has to already be waiting before vmm_load_activation raises aValid.
+# Arm before driving the activation -- `done` is a single-cycle pulse, so
+# the ILA has to already be waiting before vmm_load_activation fires.
 proc vmm_arm {} {
   global ILA ILA_PROBE_TRIGGER
   set_property TRIGGER_COMPARE_VALUE eq1'b1 \
@@ -120,6 +147,7 @@ proc vmm_capture_csv {{timeout 30}} {
   global ILA
   wait_on_hw_ila -timeout $timeout $ILA
   set data [upload_hw_ila_data $ILA]
+  display_hw_ila_data $data
   set csv [file join [pwd] "vmm_capture.csv"]
   write_hw_ila_data -csv_file $csv -force $data
   return $csv
@@ -160,9 +188,9 @@ proc vmm_decode_y {csv} {
   if {$raw eq ""} { set raw "0" }
   set word [expr {"0x$raw"}]
 
-  for {set lane 0} {$lane < 64} {incr lane} {
-    set uval [expr {($word >> ($lane * 22)) & 0x3FFFFF}]
-    puts "y\[$lane\] = [from_twos $uval 22]"
+  for {set lane 0} {$lane < 32} {incr lane} {
+    set uval [expr {($word >> ($lane * 13)) & 0x1FFF}]
+    puts "y\[$lane\] = [from_twos $uval 13]"
   }
 }
 

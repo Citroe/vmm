@@ -1,0 +1,17 @@
+target/
+project/target/
+project/project/
+test_run_dir/
+generated/
+*.vcd
+
+# IDE / build-tool local metadata
+.idea/
+.bsp/
+
+# environment-specific g++ shim working around a local Verilator/GCC PCH bug
+# (see MlpEngineSpec.scala) -- not portable, not part of the repo record.
+.toolshim/
+
+# per-component scratch docs (convenience only, not part of the repo record)
+docs/

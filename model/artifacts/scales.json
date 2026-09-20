@@ -1,0 +1,10 @@
+{
+  "e_act_in": -1,
+  "e_w1": -5,
+  "e_act_hidden": 1,
+  "e_w2": -3,
+  "requant_shift": 7,
+  "acc_exp_layer1": -6,
+  "acc_exp_layer2": -2,
+  "note": "value_real ~= int_code * 2**e ; requant = round_shift(psum, requant_shift)"
+}

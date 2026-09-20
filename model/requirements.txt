@@ -1,0 +1,5 @@
+# Phase 1 offline model + quantisation. CPU is fine (model is ~51k params).
+# Install: pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+torch>=2.4
+torchvision>=0.19
+numpy>=2.0

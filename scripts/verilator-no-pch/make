@@ -1,0 +1,11 @@
+#!/bin/sh
+# Verilator's generated Makefile uses a GCC precompiled-header trick
+# (`-include <virtual-header-name>` relying on GCC finding an adjacent
+# `<virtual-header-name>.gch`) that this system's g++ 11.4.0 doesn't
+# resolve -- it fails with "fatal error: VVmm__pch.h.fast: No such file
+# or directory" even though the .gch was just built successfully.
+# Disabling the PCH -include (pure compile-speed optimization, not
+# required for correctness -- verified VVmm.cpp compiles fine without
+# it) via a command-line variable override, which take precedence over
+# the Makefile's own `=` assignments.
+exec /usr/bin/make "$@" VK_PCH_I_FAST= VK_PCH_I_SLOW=

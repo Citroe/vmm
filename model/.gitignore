@@ -1,0 +1,14 @@
+# MNIST download cache
+data/
+# training checkpoints (regenerate with train.py)
+checkpoints/
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# Netron sanity-check export (dev convenience, not an RTL input) -- regenerate
+# with `python to_onnx.py` from a checkpoint.
+*.onnx
+
+# artifacts/ IS committed (the .hex + json the RTL consumes) -- do not ignore it

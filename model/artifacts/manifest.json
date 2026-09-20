@@ -1,0 +1,40 @@
+{
+  "dim": 32,
+  "int4_range": [
+    -8,
+    7
+  ],
+  "layers": [
+    {
+      "name": "layer1",
+      "k": 784,
+      "n": 64,
+      "input_tiles": 25,
+      "output_tiles": 2,
+      "passes": 50,
+      "psum_width": 18
+    },
+    {
+      "name": "layer2",
+      "k": 64,
+      "n": 10,
+      "input_tiles": 2,
+      "output_tiles": 1,
+      "passes": 2,
+      "psum_width": 14
+    }
+  ],
+  "weight_line_index": "((o*input_tiles + k)*DIM + row)*DIM + col",
+  "combined_weight_order": [
+    "layer1_w.hex",
+    "layer2_w.hex"
+  ],
+  "files": {
+    "layer1_w.hex": "169a0e22bccfe32b",
+    "layer2_w.hex": "c0530cc1808fa4b2",
+    "layer1_b.hex": "3004b5c81090d476",
+    "layer2_b.hex": "cc353cad876cae27",
+    "scales.json": "6c4df504a092acf1",
+    "golden.json": "1126b91c480e60de"
+  }
+}
