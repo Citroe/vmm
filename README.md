@@ -6,10 +6,11 @@ compute-in-memory core, in Chisel. Computes `y = a^T * W`: a stationary
 vector `a`, a 32-element output vector `y` with full-scale-safe
 accumulation.
 
-No bus is attached yet. This is meant to drop into
-[A-Core](https://gitlab.com/a-core) later via a RoCC or TileLink wrapper
-(A-Core is a Chisel core, hence the language choice here, even though it's
-not itself part of Chipyard) -- see "Integration" below.
+Around the core sits the start of the full system in
+`docs/riscv-cim-diagram.pdf`: a tightly coupled data memory, a job-based
+accelerator wrapper, and (until the RISC-V host is in) a small scheduler
+that runs a 784-64-10 MNIST MLP on it -- see "CIM system" and
+"Integration" below.
 
 ## Width sizing ("full scale carry, while ensuring resolution")
 
@@ -35,12 +36,19 @@ src/main/scala/vmm/
                         by a pipelined binary adder tree
   Vmm.scala            core: edge-detects aValid into MacBank's start
                         pulse, exposes the aValid/yValid handshake
-  VmmController.scala  sequencing FSM around Vmm: turns the 32-cycle
-                        weight load + aValid-pulse + yValid-wait protocol
-                        into a plain loadStart / weightRow (Decoupled) /
-                        computeStart / busy / done / error handshake
+  VmmController.scala  VmmSequencer: the sequencing FSM for Vmm -- turns the
+                        32-cycle weight load + aValid-pulse + yValid-wait
+                        protocol into a plain loadStart / weightRow
+                        (Decoupled) / computeStart / busy / done / error
+                        handshake, reaching the array through a port.
+                        VmmController: VmmSequencer + Vmm as one module
+  cim/                 the system around the array -- see "CIM system" below
+  mlp/                 MlpConfig / MlpRefModel (network shape, bit-exact
+                        integer reference model); MlpEngine (superseded
+                        by cim/, see PLAN.md)
   Main.scala           Verilog-emission entry points: `Main` -> Vmm.v,
-                        `MainController` -> VmmController.v (see caveat below)
+                        `MainController` -> VmmController.v, `MainCim` ->
+                        CimSystem.v + tcdm_bank.v (see caveat below)
 ```
 
 **Why 32x32 *and* INT4 together.** A fully-spatial `dim x dim` grid of
@@ -101,11 +109,13 @@ activation vector has settled before the multiply stage reads it -- so
 `yValid` pulses `macLatency + 1` cycles (7 at dim=32) after `aValid`.
 `Vmm` forwards `MacBank`'s `valid`/`y` back out as `yValid`/`y`.
 
-Every intermediate partial sum in the adder tree is a subset of the same
-`dim` terms `accWidth` is sized to bound in the worst case (see
-`VmmParams`), so values are padded to `accWidth` immediately at the
-multiply stage rather than grown level-by-level -- simpler, and cheap at
-this scale.
+Widths grow with the data: products are registered at `prodWidth` (8
+bits) and each adder-tree level adds one bit (9, 10, 11, 12, 13 at
+dim=32), reaching `accWidth` at the last level. The product and
+intermediate tree registers are free-running (no clock enable, no reset)
+-- only the `valid` chain and the final, `y`-driving level are gated --
+because one flip-flop enabling thousands of registers was a zero-logic,
+all-routing critical path.
 
 **One pass at a time -- now a deliberate choice, not a resource
 necessity.** `aValid` must wait for the prior `yValid`, same as the old
@@ -129,6 +139,40 @@ that cycle's write (if any) takes effect, so an in-flight pass always
 finishes against the weights that were resident when it started and a
 concurrent `weightLoad` only affects the next pass (see `VmmSpec` for a
 regression test of this).
+
+## CIM system (`src/main/scala/vmm/cim/`)
+
+The structure of `docs/riscv-cim-diagram.pdf`, minus the RISC-V host and
+the peripherals, at 32x32 instead of 64x64:
+
+```
+  host port ──────┐
+ (harness now,    ├─► Tcdm ◄──► CimAccel ◄──► Vmm
+  RISC-V later)   │   4 x 8 kB     │           the array, a separate module
+  MlpScheduler ───┘   block RAM    │           (stand-in for the macro)
+   (temporary) ── register port ───┘
+```
+
+- **`Tcdm`** -- tightly coupled data memory: four 8 kB block-RAM banks
+  behind a single-cycle interconnect (masters on different banks are served
+  together, round-robin on the same bank), OBI-shaped ports. It holds the
+  image, the weights and biases, and the hidden activations and logits a
+  run produces; `CimMap` is the memory map.
+- **`CimAccel`** -- the digital wrapper around the array: control/status
+  registers, a `Streamer` (TCDM to array and back, one 32-bit word per
+  cycle), the array's `VmmSequencer`, and `PostProc` (accumulate across
+  passes, bias, ReLU, requantise). It runs *jobs* and knows nothing about
+  the network: set the weight / input / bias / result pointers and a mode
+  word, write START, wait for `done`.
+- **`MlpScheduler`** -- temporary. It plays the firmware: issues the 52
+  jobs of the 784-64-10 MLP over the register port, then reads the logits
+  from the TCDM for the argmax. When the RISC-V core arrives it takes over
+  the register port and the host port and this module is deleted; nothing
+  else changes.
+- **`CimSystem`** -- the four wired together.
+
+One inference is 8184 cycles (~82 us at 100 MHz); loading each 32x32 tile
+from the TCDM a word at a time (128 cycles) is most of it.
 
 ## Building and testing
 
@@ -164,13 +208,23 @@ self-checking testbenches (for Vivado xsim) for the core and the
 controller respectively — same golden model, `PASS:`/`FAIL:` at
 `$finish`.
 
+`vmm.cim`'s specs cover the new system: `TcdmSpec` (storage, byte enables,
+parallel and contended access), `CimAccelSpec` (single jobs against plain
+integer arithmetic) and `CimSystemSpec` (every committed golden image,
+loaded through the host port, bit-exact against `MlpRefModel` on the
+hidden activations, the logits and the class).
+
 At dim=32 (1024 PEs), treadle (chiseltest's default Scala-interpreter
-backend) is fine for every test, including the full-size one -- no
-`VerilatorBackendAnnotation`/Verilator dependency needed anymore now that
-the array is fully-spatial-but-small rather than the old design's
-4096-PE, `O(n^2)`-combinational-scheduler shape. (`scripts/verilator-no-pch`
-is kept around in case a future dim/config resurrects the need for
-Verilator -- see git history for the PCH workaround it encodes.)
+backend) is fine for the `Vmm` / `VmmController` tests, including the
+full-size ones. The `vmm.cim` and `MlpEngine` specs need **Verilator**
+(the full network is far too slow on treadle, and the TCDM banks are a
+Verilog black box), and in this environment Verilator needs a `g++` shim
+and ccache disabled to get past a GCC precompiled-header bug -- see
+`CimSystemSpec`'s doc comment:
+
+```
+PATH=$PWD/.toolshim:$PATH CCACHE_DISABLE=1 sbt test
+```
 
 ### Caveat: Verilog emission uses the classic Scala FIRRTL Compiler
 
@@ -205,13 +259,13 @@ constraint on `clock`, then `report_timing_summary`. Top/source default to
 generated/VmmController.v` for the FSM wrapper. Run against Vivado 2024.1 /
 `xc7z020clg400-1`, post-route signoff numbers (not router-estimated):
 
-| Metric | `Vmm` core (2026-08-27) | `VmmController` (2026-09-06, hardened) |
+| Metric | `Vmm` core (2026-08-27, not re-run) | `VmmController` (2026-10-10) |
 |---|---|---|
-| WNS (setup) | +0.327 ns | +0.393 ns |
-| WHS (hold) | +0.134 ns | +0.096 ns |
-| Failing endpoints | 0 / 38,375 | 0 / 43,785 |
-| Slice LUTs | 27,489 (51.7%) | 27,942 (52.5%) |
-| Slice Registers | 23,432 (22.0%) | 24,003 (22.6%) |
+| WNS (setup) | +0.327 ns | +0.220 ns |
+| WHS (hold) | +0.134 ns | +0.098 ns |
+| Failing endpoints | 0 / 38,375 | 0 / 25,033 |
+| Slice LUTs | 27,489 (51.7%) | 25,396 (47.7%) |
+| Slice Registers | 23,432 (22.0%) | 22,883 (21.5%) |
 | DSPs | 0 / 220 | 0 / 220 |
 
 Reports: `fpga/timing_check_report.rpt` /
@@ -219,40 +273,33 @@ Reports: `fpga/timing_check_report.rpt` /
 utilization pair). Timing is met at 100MHz on both setup and hold with
 zero failing endpoints for both the core and the FSM wrapper -- the
 pipelined adder tree fixes what the old unpipelined dim=64 design failed
-at (WNS -14.9ns). The critical path is in the datapath adder tree, not the
-FSM, so setup slack tracks P&R run-to-run variance (the `VmmController`
-number has been seen at +0.128 and +0.393 ns across runs) more than added
-FSM logic -- treat it as "tight, ~0.1-0.4 ns" and re-run
-`fpga/timing_check.tcl` (with the `VmmController` args) after any change to
-the controller or datapath before assuming it still holds. Both runs are
+at (WNS -14.9ns). The `Vmm` column and the LUT-budget table
+above predate the 2026-10-10 `MacBank` cleanup (free-running, width-trimmed
+datapath registers) and have not been re-run; the `VmmController` column
+is post-cleanup. Setup slack at this constraint is not a measure of
+margin: Vivado stops optimising once 10 ns is met, so the reported worst
+path is a lazily routed zero-logic net and WNS lands at +0.1-0.4 ns run to
+run (see `PLAN.md` for an 8 ns `MlpEngine` run that shows the real
+margin). Re-run `fpga/timing_check.tcl` after any change to the controller
+or datapath. Both runs are
 OOC with `HD.CLK_SRC` unset, so clock-tree delay/skew is not modelled; the
 number after full-device implementation with the real `FCLK_CLK0` BUFG
 will differ.
 
-## Integration (partly started)
+## Integration
 
-`VmmController` (see `VmmController.scala`) is a first step: a sequencing
-FSM that wraps `Vmm` and turns its cycle-timed protocol into a
-`loadStart` / `weightRow` (Decoupled) / `computeStart` / `busy` / `done` /
-`error` handshake. It is bus-agnostic — no AXI/RoCC/TileLink yet — but it
-is what the FPGA bring-up harness (`fpga/`) now drives over JTAG, and it
-is the clean attachment point for a bus wrapper.
+The attachment points for the RISC-V host are in place and are what the
+temporary pieces use today (see "CIM system" above):
 
-Remaining, either of which wraps `VmmController` rather than changing it:
+- the **TCDM host port** (`CimSystem.io.host`, OBI-shaped) -- the core's
+  data port. The FPGA harness drives it now to write test images and read
+  results back.
+- the **accelerator register port** (`CimRegPort`: pointers, mode,
+  START / status, plus a `done` event) -- to go behind the peripheral bus.
+  `MlpScheduler` drives it now.
 
-- **RoCC**, if A-Core exposes a RoCC-style custom-instruction port:
-  weight-row loads and `a`-vector loads as custom instructions, `done`
-  gating a `resp`.
-- **AXI-Lite / TileLink MMIO**, if not: a handful of registers (weight-row
-  write port feeding `weightRow`, `a`-vector write port + `computeStart`
-  bit, status from `busy`/`done`/`error`, `y` readback), with the bus
-  width driving how weight-row/`a`-vector writes get serialized into the
-  wide ports.
-
-Beyond the bus wrapper, the actual end goal is a controller driving this
-core for MLP inference (784->64->10) on real images, with im2col-based
-convolution and INT4 quantization-aware training (QAT) as follow-on work
--- out of scope here; this repo is the VMM core plus its sequencing FSM.
-
-Worth deciding once A-Core's actual accelerator-attachment interface
-(from its docs/RTL, not guessed at here) is in hand.
+Remaining, per `docs/riscv-cim-diagram.pdf`: the core itself with its
+instruction memory, an APB front end on the register port, the event unit
+(`done` as an interrupt), and the peripherals. `VmmController` remains the
+self-contained array + sequencer for the standalone JTAG harness
+(`fpga/vmm_debug.v`).

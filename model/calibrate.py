@@ -17,15 +17,27 @@ pass over `n_batches` of the test set.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import re
 
-import numpy as np
 import torch
 
-from config import CKPT_DIR, ROOT
-from quant import choose_pow2_exponent, round_half_up
+from config import INT4_MIN, INT4_MAX, ROOT
+from data import test_loader
 from model import MLP
-from config import INT4_MIN, INT4_MAX
+from quant import round_half_up
+
+FXP_KEYS = ("e_act_in", "e_w1", "e_act_hidden", "e_w2")
+
+
+def max_abs_exponent(x: torch.Tensor) -> int:
+    """Smallest integer e such that  max|x| / 2**e  <=  INT4_MAX, i.e. the
+    coarsest-needed scale at which nothing clamps. Centre of the MSE search."""
+    m = float(x.abs().max())
+    if m == 0.0:
+        return -7
+    return math.ceil(math.log2(m / INT4_MAX))
 
 
 def _mse_at(x: torch.Tensor, e: int) -> float:
@@ -36,7 +48,7 @@ def _mse_at(x: torch.Tensor, e: int) -> float:
 
 def best_exponent(x: torch.Tensor, span: int = 4) -> tuple[int, dict]:
     x = torch.as_tensor(x).detach().float().reshape(-1)
-    e0 = choose_pow2_exponent(x)
+    e0 = max_abs_exponent(x)
     cands = list(range(e0 - span, e0 + 2))
     mses = {e: _mse_at(x, e) for e in cands}
     best = min(mses, key=mses.get)
@@ -47,7 +59,6 @@ def best_exponent(x: torch.Tensor, span: int = 4) -> tuple[int, dict]:
 
 @torch.no_grad()
 def collect_activations(model: MLP, n_batches: int = 20):
-    from data import test_loader
     xs, hs = [], []
     for i, (xb, _) in enumerate(test_loader()):
         if i >= n_batches:
@@ -88,12 +99,12 @@ def search(ckpt: str) -> dict:
 def patch_config(vals: dict) -> None:
     p = ROOT / "config.py"
     src = p.read_text()
-    for key in ("e_act_in", "e_w1", "e_act_hidden", "e_w2"):
+    for key in FXP_KEYS:
         src = re.sub(rf"(\n    {key}: int = )-?\d+",
                      rf"\g<1>{vals[key]}", src, count=1)
     p.write_text(src)
     print(f"patched {p} FXP exponents -> "
-          + ", ".join(f"{k}={vals[k]}" for k in ("e_act_in", "e_w1", "e_act_hidden", "e_w2")))
+          + ", ".join(f"{k}={vals[k]}" for k in FXP_KEYS))
 
 
 def main() -> None:
@@ -103,7 +114,6 @@ def main() -> None:
     args = ap.parse_args()
 
     res = search(args.ckpt)
-    import json
     print(json.dumps(res, indent=2))
     if args.write:
         patch_config(res)

@@ -36,3 +36,16 @@ object MainController extends App {
 object MainMlp extends App {
   (new chisel3.stage.ChiselStage).emitVerilog(new vmm.mlp.MlpEngine(), args)
 }
+
+/** Emits `CimSystem.v` -- TCDM + accelerator + array + the temporary MLP
+  * scheduler -- plus `tcdm_bank.v` (the block-RAM black box) next to it.
+  * The TCDM banks are initialised from `tcdm_bank{0..3}.mem`
+  * (fpga/gen_mlp_mem.py), named without a directory: Vivado finds them among
+  * the project's memory files, a simulator in its working directory.
+  *
+  *   sbt "runMain vmm.MainCim --target-dir generated"
+  */
+object MainCim extends App {
+  (new chisel3.stage.ChiselStage).emitVerilog(
+    new vmm.cim.CimSystem(Seq.tabulate(vmm.cim.CimMap.Banks)(b => s"tcdm_bank$b.mem")), args)
+}

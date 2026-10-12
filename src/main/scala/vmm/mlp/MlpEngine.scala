@@ -64,25 +64,18 @@ import MlpConfig._
   *
   * ==Known skeleton shortcuts (flagged for Phase 5 hardening)==
   *   - The activation store is banked per input-tile (`actBanks`, 25 x
-  *     `Dim`-wide) and the weight store is one flat, scalar-element `Mem`
-  *     per lane (`weightMems`, `Dim` x `WeightBeats`-deep) rather than a
-  *     single `Mem` of `Vec(Dim, SInt)` -- both shapes exist specifically
-  *     because the naive version of each (one flat `Dim*inputTiles`-deep
-  *     dynamically-indexed `Reg(Vec(...))`, and one aggregate-typed `Mem`)
-  *     measured **single-digit seconds per cycle** under chiseltest's
-  *     treadle backend: the classic FIRRTL compiler this project targets
-  *     (see Main.scala) doesn't lower an aggregate-element `Mem` to a real
-  *     memory primitive, so it was expanding into a per-element register
-  *     array plus a huge read mux, and treadle re-evaluates that mux, as
-  *     part of the always-live top-level `ctrl.io.a` / `ctrl.io.weightRow`
-  *     wiring, every single cycle regardless of state. Correctness-wise
-  *     the naive shapes were fine; this is purely a size/speed fix, and
-  *     the resulting flat-per-lane `Mem`s are also just better hardware
-  *     (real BRAM/LUTRAM inference candidates) for Phase 5 to check.
-  *   - The weight/bias stores are combinational-read `Mem` (LUTRAM/register
-  *     inference), not `SyncReadMem` (BRAM) -- simplest correct thing for a
-  *     first cut; PLAN.md's Phase 5 already expects to "check it still fits
-  *     xc7z020" after this module exists.
+  *     `Dim`-wide) rather than one flat `Dim*inputTiles`-deep
+  *     dynamically-indexed `Reg(Vec(...))`: the flat version measured
+  *     **single-digit seconds per cycle** under chiseltest's treadle
+  *     backend (a huge read mux on the always-live `ctrl.io.a` wiring).
+  *   - The weight store is one `SyncReadMem` of packed `Dim*InWidth`-bit
+  *     row words (block RAM), read strictly sequentially through `rdPtr`
+  *     -- see the comment at `weightMem`. The word is a packed `UInt`, not
+  *     a `Vec(Dim, SInt)`, because the classic FIRRTL compiler this
+  *     project targets (see Main.scala) doesn't lower an aggregate-element
+  *     memory to a real memory primitive.
+  *   - The bias store is still a combinational-read `Mem` (96 x 18b, read
+  *     at constant addresses, so it synthesises to registers).
   *   - `weightRow`/`biasWord`/`imgPixel` are held streaming continuously by
   *     this engine's own FSM (never gapped mid-tile), so the inner
   *     `VmmController`'s own `loadTimeout` can never trip from *our* side;
@@ -141,16 +134,20 @@ class MlpEngine(
   // ---------------------------------------------------------------------
   // Weight rows, flat-addressed by global beat index (0 until WeightBeats):
   // layer 1's 50 tiles (o outer, k inner) x 32 rows, then layer 2's 2 x 32.
-  // Loading and reading during compute share this exact addressing scheme.
-  // One flat, scalar-element `Mem` per lane (not a single `Mem` of
-  // `Vec(Dim, SInt)`) -- an aggregate-typed `Mem` doesn't lower to a real
-  // memory primitive on the classic FIRRTL compiler backend this project
-  // uses (see Main.scala), so it was instead expanding into a per-element
-  // register array plus a WeightBeats-deep mux replicated Dim ways: the
-  // same shape of blowup `actBanks` fixed for the activation store, just
-  // on the weight-load side, and just as fatal for both simulator speed
-  // and the LUT count Phase 5 will eventually check.
-  val weightMems = Seq.fill(Dim)(Mem(WeightBeats, SInt(InWidth.W)))
+  // One synchronous-read memory of packed row words (lane 0 in the low
+  // bits), so it maps to block RAM. An inference visits the tiles in
+  // exactly the order they were loaded, so the read side needs no
+  // (layer, o, k) -> address arithmetic: `rdPtr` starts at 0 on `start` and
+  // advances by one per row handed to the controller.
+  val weightMem = SyncReadMem(WeightBeats, UInt((Dim * InWidth).W))
+  val rdPtr     = RegInit(0.U(beatW.W))
+  // The read address is the *next* row to present: a row accepted this
+  // cycle makes its successor appear on the memory output the cycle after,
+  // and while nothing is accepted the output holds the current row.
+  val feedFire = Wire(Bool())
+  val weightRd = weightMem.read(Mux(feedFire, rdPtr + 1.U, rdPtr))
+  val weightRdRow = VecInit(Seq.tabulate(Dim)(col =>
+    weightRd((col + 1) * InWidth - 1, col * InWidth).asSInt))
   // Bias, flat-addressed 0 until BiasBeats: layer 1's 64, then layer 2's 32
   // (10 real + 22 padding, never read back). Sign-extended to MaxPsumWidth
   // by the caller (see class doc).
@@ -172,6 +169,9 @@ class MlpEngine(
   val hiddenReg = Reg(Vec(Layer1.n, SInt(InWidth.W)))
   val logitsReg = Reg(Vec(Layer2.n, SInt(Layer2.psumWidth.W)))
   val clsReg    = RegInit(0.U(clsW.W))
+  // Running maximum and scan index for the one-compare-per-cycle argmax.
+  val bestReg   = Reg(SInt(Layer2.psumWidth.W))
+  val argIdx    = RegInit(0.U(clsW.W))
   // Cross-input-tile partial-sum buffer for the *current* output-tile, one
   // lane per VMM column. Sized to the wider layer (18b); layer 2 just uses
   // the low bits of the same lanes.
@@ -185,13 +185,12 @@ class MlpEngine(
   val layerReg = RegInit(0.U(1.W)) // 0 = layer 1, 1 = layer 2
   val oReg     = RegInit(0.U(1.W)) // output-tile index (Layer1 has 2, Layer2 has 1)
   val kReg     = RegInit(0.U(kW.W)) // input-tile index within the current output-tile
-  val rowCtr   = RegInit(0.U(rowW.W))
   val beatCtr  = RegInit(0.U(beatW.W))
   val loadStall = RegInit(0.U(log2Ceil(loadTimeout + 1).W))
 
   val curInputTiles = Mux(layerReg === 0.U, Layer1.inputTiles.U, Layer2.inputTiles.U)
 
-  val sIdle :: sLoadW :: sLoadB :: sLoadImg :: sTileStart :: sFeedW :: sCompStart :: sCompWait :: sPostTile :: sCommitHidden :: sArgmax :: Nil = Enum(11)
+  val sIdle :: sLoadW :: sLoadB :: sLoadImg :: sTileStart :: sFeedW :: sCompStart :: sCompWait :: sPostTile :: sCommitHidden :: sArgmax :: sDone :: Nil = Enum(12)
   val state = RegInit(sIdle)
 
   // Rising-edge-detect the four "go" strobes (same reasoning as VmmController:
@@ -204,13 +203,6 @@ class MlpEngine(
   val biasLoadPulse   = io.biasLoad && !biasLoadPrev
   val imgLoadPulse    = io.imgLoad && !imgLoadPrev
   val startPulse      = io.start && !startPrev
-
-  // Global weight-tile index for the current (layer, o, k), matching the
-  // loader's tile-major order (layer 1's 50 tiles, then layer 2's 2).
-  private val layer1Tiles = Layer1.outputTiles * Layer1.inputTiles
-  val tileBase = Mux(layerReg === 0.U,
-    oReg * Layer1.inputTiles.U + kReg,
-    layer1Tiles.U + (oReg * Layer2.inputTiles.U + kReg))
 
   // ---- fixed-point helpers, bit-exact mirrors of MlpRefModel/quant.py ----
   private def roundShiftHw(x: SInt, s: Int): SInt = {
@@ -231,9 +223,11 @@ class MlpEngine(
   // ---- defaults ----
   ctrl.io.loadStart    := false.B
   ctrl.io.weightRow.valid := false.B
-  ctrl.io.weightRow.bits  := VecInit(Seq.tabulate(Dim)(col => weightMems(col).read(tileBase * Dim.U + rowCtr)))
+  ctrl.io.weightRow.bits  := weightRdRow
   ctrl.io.computeStart := false.B
   ctrl.io.a            := actBanks(kReg)
+  feedFire := ctrl.io.weightRow.fire
+  when(feedFire) { rdPtr := rdPtr + 1.U }
 
   io.weightRow.ready := false.B
   io.biasWord.ready   := false.B
@@ -250,6 +244,7 @@ class MlpEngine(
         layerReg := 0.U
         oReg     := 0.U
         kReg     := 0.U
+        rdPtr    := 0.U
         for (i <- 0 until Dim) psumReg(i) := 0.S
         errReg := false.B
         state  := sTileStart
@@ -274,7 +269,7 @@ class MlpEngine(
     is(sLoadW) {
       io.weightRow.ready := true.B
       when(io.weightRow.fire) {
-        for (col <- 0 until Dim) weightMems(col).write(beatCtr, io.weightRow.bits(col))
+        weightMem.write(beatCtr, io.weightRow.bits.asUInt)
         beatCtr   := beatCtr + 1.U
         loadStall := 0.U
         when(beatCtr === (WeightBeats - 1).U) { state := sIdle }
@@ -315,20 +310,19 @@ class MlpEngine(
     is(sTileStart) {
       // One-cycle loadStart pulse into the controller for this tile;
       // ctrl edge-detects it the same way VmmController's own doc describes.
+      // The memory is reading `rdPtr` (this tile's row 0) during this cycle,
+      // so the row is on its output when sFeedW starts.
       ctrl.io.loadStart := true.B
-      rowCtr := 0.U
-      state  := sFeedW
+      state := sFeedW
     }
 
     is(sFeedW) {
       // Held continuously (valid high every cycle) so ctrl's own loadTimeout
       // can never trip from our side -- see class doc.
+      // Tiles are Dim rows and start on a multiple of Dim, so the low bits
+      // of rdPtr are the row within the tile.
       ctrl.io.weightRow.valid := true.B
-      ctrl.io.weightRow.bits  := VecInit(Seq.tabulate(Dim)(col => weightMems(col).read(tileBase * Dim.U + rowCtr)))
-      when(ctrl.io.weightRow.fire) {
-        rowCtr := rowCtr + 1.U
-        when(rowCtr === (Dim - 1).U) { state := sCompStart }
-      }
+      when(feedFire && rdPtr(rowW - 1, 0) === (Dim - 1).U) { state := sCompStart }
     }
 
     is(sCompStart) {
@@ -379,7 +373,8 @@ class MlpEngine(
           val withBias = psumReg(col) +& biasMem.read((Layer1.n + col).U)
           logitsReg(col) := withBias(Layer2.psumWidth - 1, 0).asSInt
         }
-        state := sArgmax
+        argIdx := 0.U
+        state  := sArgmax
       }
     }
 
@@ -397,23 +392,20 @@ class MlpEngine(
     }
 
     is(sArgmax) {
-      var bestVal = logitsReg(0)
-      var bestIdx = 0.U(clsW.W)
-      for (i <- 1 until Layer2.n) {
-        val better = logitsReg(i) > bestVal
-        bestVal = Mux(better, logitsReg(i), bestVal)
-        bestIdx = Mux(better, i.U(clsW.W), bestIdx)
+      // One logit per cycle against the running maximum (a single
+      // comparator, not a 9-deep combinational compare chain). Strict `>`
+      // keeps the lowest index on ties, matching the reference argmax.
+      val cur = logitsReg(argIdx)
+      when(argIdx === 0.U || cur > bestReg) {
+        bestReg := cur
+        clsReg  := argIdx
       }
-      clsReg  := bestIdx
-      // clsReg (like VmmController's yReg) only lands on the *next* clock
-      // edge, but `done` needs to be trustworthy on this same cycle -- so
-      // also drive io.cls combinationally with the just-computed value
-      // here, overriding the `io.cls := clsReg` default. Without this, a
-      // reader sampling on the done pulse (as MlpEngineSpec does) sees the
-      // previous inference's (or the RegInit) stale class instead of this
-      // one's -- found the hard way, by actually simulating (Verilator; see
-      // MlpEngineSpec's doc comment).
-      io.cls  := bestIdx
+      argIdx := argIdx + 1.U
+      when(argIdx === (Layer2.n - 1).U) { state := sDone }
+    }
+
+    is(sDone) {
+      // clsReg settled on the previous edge, so `cls` is valid with `done`.
       io.done := true.B
       state   := sIdle
     }

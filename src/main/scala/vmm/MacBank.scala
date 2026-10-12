@@ -21,11 +21,10 @@ import chisel3.util.log2Ceil
   * `start` to `valid`: one cycle to register the dim x dim products, plus
   * one register stage per adder-tree level (log2Ceil(dim) levels). This
   * is constant in dim, replacing the old design's linear `dim` cycles.
-  * Every intermediate partial sum is a subset of the same dim terms
-  * accWidth is sized to bound in the worst case (see VmmParams), so no
-  * partial sum can overflow accWidth bits either -- values are padded to
-  * accWidth immediately at the multiply stage rather than grown
-  * level-by-level.
+  * Widths grow with the data: products are prodWidth bits and each
+  * adder-tree level adds one bit, reaching accWidth at the last level
+  * (see VmmParams), so every sum is exact with no bit carried that the
+  * data cannot use.
   *
   * `start` must be a single-cycle pulse and must not be asserted again
   * until `valid` has pulsed for the prior pass -- kept as a deliberate
@@ -34,12 +33,13 @@ import chisel3.util.log2Ceil
   * resource that would force it structurally; see Vmm, which
   * edge-detects `aValid` into exactly that pulse.
   *
-  * `weightLoad` racing an in-flight pass: the dim x dim products are
-  * captured into registers combinationally from `weightMem` on the same
-  * cycle `start` is asserted, before that cycle's `weightLoad` write (if
-  * any) takes effect -- so an in-flight pass always finishes against the
-  * weights that were resident when it started, and a concurrent
-  * `weightLoad` only affects the next pass. See VmmSpec for a regression
+  * `weightLoad` racing an in-flight pass: the products a pass uses are the
+  * ones registered from `weightMem` on the cycle `start` is asserted,
+  * before that cycle's `weightLoad` write (if any) takes effect -- so an
+  * in-flight pass always finishes against the weights that were resident
+  * when it started, and a concurrent `weightLoad` only affects the next
+  * pass (later products do change with the new weights, but they trail
+  * the pass through the pipeline and never reach the enabled `y` stage). See VmmSpec for a regression
   * test of this.
   */
 class MacBank(p: VmmParams) extends Module {
@@ -64,40 +64,49 @@ class MacBank(p: VmmParams) extends Module {
     weightMem(io.weightRow) := io.weightRowData
   }
 
-  // Stage 0->1: register all dim x dim products the cycle after `start`,
-  // padded to accWidth immediately (exact: INT_inWidth x INT_inWidth
-  // never needs more than prodWidth <= accWidth bits).
+  // Stage 0->1: register all dim x dim products at their natural
+  // prodWidth (exact: INT_inWidth x INT_inWidth never needs more).
+  //
+  // The product and intermediate adder-tree registers are free-running: no
+  // clock enable, no reset. A single flip-flop enabling thousands of
+  // registers was the critical path (zero logic, ~9 ns of routing), and
+  // nothing needs those registers to hold -- the `valid` chain alone marks
+  // which cycle carries a pass's data, and only the final stage (which
+  // drives `y`) is enabled, so `y` still holds between passes. `start` is
+  // therefore just the head of the valid chain: the products sampled on
+  // that cycle are the ones the pass's `valid` lines up with.
+  val numLevels = log2Ceil(p.dim)
   val prodValid = RegNext(io.start, false.B)
-  val prod = RegInit(VecInit.fill(p.dim, p.dim)(0.S(p.accWidth.W)))
-  when(io.start) {
+  val prod = Reg(Vec(p.dim, Vec(p.dim, SInt(p.prodWidth.W))))
+  when(io.start || (numLevels != 0).B) {
     for (r <- 0 until p.dim) {
       for (c <- 0 until p.dim) {
-        prod(r)(c) := (io.a(r) * weightMem(r)(c)).pad(p.accWidth).asSInt
+        prod(r)(c) := io.a(r) * weightMem(r)(c)
       }
     }
   }
 
   // Stage 1..macLatency-1: pipelined per-column binary adder tree, one
   // register stage per level, halving the term count each level
-  // (dim -> dim/2 -> ... -> 1). Deliberately not merged with the multiply
-  // stage above, and deliberately registered at every level rather than
-  // left as one wide combinational reduction -- the old design's
-  // unpipelined-wide-combinational accumulate is implicated in its
-  // inherited timing-closure failure (see fpga/README.md), so this avoids
-  // repeating that shape.
-  val numLevels = log2Ceil(p.dim)
+  // (dim -> dim/2 -> ... -> 1) and growing one bit per level
+  // (prodWidth+1, ..., accWidth). Deliberately not merged with the
+  // multiply stage above, and deliberately registered at every level
+  // rather than left as one wide combinational reduction -- the old
+  // design's unpipelined-wide-combinational accumulate is implicated in
+  // its inherited timing-closure failure (see fpga/README.md), so this
+  // avoids repeating that shape.
   var terms: Seq[Vec[SInt]] =
     (0 until p.dim).map(c => VecInit((0 until p.dim).map(r => prod(r)(c))))
   var levelValid = prodValid
   for (level <- 0 until numLevels) {
     val halfLen = terms.head.length / 2
     val nextValid = RegNext(levelValid, false.B)
-    val nextTerms = Seq.fill(p.dim)(Reg(Vec(halfLen, SInt(p.accWidth.W))))
-    when(levelValid) {
+    val nextTerms = Seq.fill(p.dim)(Reg(Vec(halfLen, SInt((p.prodWidth + level + 1).W))))
+    // Only the last level holds its value (it is `y`).
+    when(levelValid || (level != numLevels - 1).B) {
       for (c <- 0 until p.dim) {
         for (i <- 0 until halfLen) {
-          val sum = terms(c)(2 * i) +& terms(c)(2 * i + 1) // SInt((accWidth+1).W)
-          nextTerms(c)(i) := sum(p.accWidth - 1, 0).asSInt // safe to drop the guard bit: see class doc
+          nextTerms(c)(i) := terms(c)(2 * i) +& terms(c)(2 * i + 1)
         }
       }
     }

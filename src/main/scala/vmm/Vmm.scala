@@ -3,6 +3,20 @@ package vmm
 import chisel3._
 import chisel3.util.log2Ceil
 
+/** Port bundle of [[Vmm]] (protocol in Vmm's doc); [[VmmSequencer]] drives the
+  * flipped side. */
+class VmmIO(p: VmmParams) extends Bundle {
+  val weightLoad    = Input(Bool())
+  val weightRow     = Input(UInt(log2Ceil(p.dim).W))
+  val weightRowData = Input(Vec(p.dim, SInt(p.inWidth.W)))
+
+  val aValid = Input(Bool())
+  val a      = Input(Vec(p.dim, SInt(p.inWidth.W)))
+
+  val yValid = Output(Bool())
+  val y      = Output(Vec(p.dim, SInt(p.accWidth.W)))
+}
+
 /** Top-level VMM/CiM core: y = a^T * W, W stationary, dim x dim, inWidth-bit
   * signed in, full-scale-safe accWidth-bit accumulate out. No bus
   * (AXI-Lite/RoCC/TileLink) attached yet -- that's a wrapper around this
@@ -22,17 +36,7 @@ import chisel3.util.log2Ceil
   * controller wants back-to-back throughput.
   */
 class Vmm(val p: VmmParams = VmmParams()) extends Module {
-  val io = IO(new Bundle {
-    val weightLoad    = Input(Bool())
-    val weightRow     = Input(UInt(log2Ceil(p.dim).W))
-    val weightRowData = Input(Vec(p.dim, SInt(p.inWidth.W)))
-
-    val aValid = Input(Bool())
-    val a      = Input(Vec(p.dim, SInt(p.inWidth.W)))
-
-    val yValid = Output(Bool())
-    val y      = Output(Vec(p.dim, SInt(p.accWidth.W)))
-  })
+  val io = IO(new VmmIO(p))
 
   val bank = Module(new MacBank(p))
 

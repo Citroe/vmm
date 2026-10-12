@@ -24,6 +24,75 @@ bitstream), see **`fpga/MANUAL_SETUP.md`**. The tcl-scripted path below is
 the fast route; the manual doc is for when you want each step visible or
 the scripts hit a Vivado-version difference.
 
+## MLP harness (`mlp_debug`) — the whole 784-64-10 network
+
+A second, separate harness runs the whole network on `CimSystem` (TCDM +
+CIM accelerator + array + the temporary MLP scheduler; see the root
+`README.md`). The rest of this file describes the older
+`VmmController`-only harness (`vmm_debug.v`); the PS7-init and
+Hardware-Manager notes below apply to both.
+
+Nothing is loaded over JTAG. The weights and biases are the initial
+contents of the TCDM's four block-RAM banks, and the 16 golden test images
+are a ROM in the harness, all built into the bitstream. For each image a
+small FSM plays the host: it copies the image into the TCDM through the
+system's host port, starts a run, reads the ten logits back out of the TCDM
+and compares them and the class against the golden values. A full board
+test is one VIO pulse and one readback.
+
+| File | Role |
+|---|---|
+| `gen_mlp_mem.py` | packs `model/artifacts/` into `mem/*.mem`: the four TCDM bank images, the image ROM, the expected results (re-run after a re-export) |
+| `mlp_debug_core.v` | image ROM + host FSM + checker around `CimSystem`; no vendor IP |
+| `mlp_debug.v` | top: reset synchroniser, `mlp_debug_core`, VIO (`vio_mlp`), ILA (`ila_mlp`) |
+| `create_mlp_debug_ip.tcl` | generates `vio_mlp` / `ila_mlp` |
+| `build_mlp.tcl` | one-shot project + block design + bitstream |
+| `run_mlp_hw_test.tcl` | Hardware-Manager procs: `mlp_run_all`, `mlp_run <i>`, `mlp_status`, `mlp_reset` |
+| `../sim/tb_mlp_debug.v` | self-checking testbench for `mlp_debug_core` |
+
+Build (from the repo root; `-max_dsp 0`, 100 MHz `FCLK_CLK0`, same as the
+checkpoints):
+
+```
+sbt "runMain vmm.MainCim --target-dir generated"   # CimSystem.v + tcdm_bank.v
+python3 fpga/gen_mlp_mem.py
+vivado -mode batch -source fpga/build_mlp.tcl
+```
+
+This writes `fpga/build/mlp_debug/mlp_debug.runs/impl_1/system_wrapper.bit`
+(+ `.ltx`) and `fpga/mlp_debug_{timing,utilization}.rpt`.
+
+Last build (2026-10-12, Vivado 2024.1, full device with the real
+`FCLK_CLK0` clock): timing met, WNS +0.232 ns, WHS +0.010 ns, 0 failing
+endpoints; 30,974 LUTs (58.2%), 28,531 registers, 27 block-RAM tiles
+(19%: 8 for the TCDM, the rest mostly the ILA's 4096-sample buffer), 0
+DSPs. The previous `MlpEngine`-based harness was 33,424 LUTs / 35 tiles.
+
+Run on the board:
+
+1. Program `system_wrapper.bit` with its `.ltx`.
+2. Initialise the PS7 over XSCT so `FCLK_CLK0` runs (see "Getting debug
+   cores to show up at all" below). `ps7_init.tcl` is under
+   `fpga/build/mlp_debug/mlp_debug.gen/sources_1/bd/system/ip/system_processing_system7_0_0/`.
+3. In the Hardware Manager Tcl console:
+   ```tcl
+   source fpga/run_mlp_hw_test.tcl
+   mlp_run_all     ;# expect: pass_mask = FFFF, "PASS: all 16 golden images match"
+   mlp_run 5       ;# one image: class, golden class, label, cycles, logits
+   ```
+   By hand in the VIO dashboard: toggle `vio_run_all` 0 → 1 → 0 and read
+   `core_pass_mask` (expect `FFFF`) and `core_error` (expect 0).
+
+VIO and ILA probe maps are documented at the top of `mlp_debug.v`.
+`core_cycles` reports the measured start-to-done latency of the last run
+(8185 cycles in simulation, the same for every image). The ILA's `logits`
+probe is the harness's read-back copy: it updates about 12 cycles after
+`done`, so trigger on `done` with some post-trigger depth to see it.
+
+`run_mlp_hw_test.tcl` has not been run against a device yet; the probe
+names it looks up are the net names in `mlp_debug.v` and may need adjusting
+(the script says how).
+
 ## Build order
 
 With a Vivado project open, targeting the Pynq-Z2:

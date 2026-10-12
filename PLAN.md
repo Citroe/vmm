@@ -3,7 +3,8 @@
 Redrafted 2026-09-06 from `C:\DOCUMTENS\riscv-vmm-2.docx` (design notes +
 status snapshot + whiteboard photos) and `riscv-vmm.docx` (original 64×64
 plan), reconciled against the current repo state. Supersedes the "downsize
-to 32×32 INT4" plan, which is complete.
+to 32×32 INT4" plan, which is complete. Restructured 2026-10-12 toward
+`docs/riscv-cim-diagram.pdf` — see Phase 5b.
 
 The docx's 7 embedded images are zooms of one hand-drawn Miro board. What
 they add, on top of the text notes, is folded into the sections below:
@@ -168,26 +169,38 @@ De-risked everything built on top of the FSM.
   `computeTimeout: Int = 0` (0 ⇒ `macLatency + 4`). Defaults keep the
   prior behaviour; `Main`/`MainController` unaffected.
 
-### Phase 1 — Offline model + quantisation
+### Phase 1 — Offline model + quantisation — **DONE (2026-09-13)**
 
 Produces the weight/bias artefacts the RTL consumes. No Chisel here.
+Code in `model/` (see `model/README.md`); tidied 2026-10-10 with the
+committed artefacts re-exported byte-identical.
 
-- [ ] Train a 784-64-10 MLP (framework TBD — PyTorch likely), MNIST.
-- [ ] QAT to INT4 weights **and** INT4 activations.
+- [x] Train a 784-64-10 MLP on MNIST — PyTorch, `train.py`.
+- [x] QAT to INT4 weights **and** INT4 activations — hand-rolled fake-quant
+      + straight-through estimator (`quant.py`).
 - [x] **FP → fixed-point ("fxd. F").** Per-tensor, power-of-two scales,
       MSE-calibrated (`calibrate.py`), frozen in `config.FXP` — see open
       decision #3. Requant between layers is an arithmetic shift + clamp
       to `[-8, 7]`, no multiplier.
-- [ ] Bias: quantise to the accumulator's fixed-point (INT13, or the wider
+- [x] Bias: quantise to the accumulator's fixed-point (INT13, or the wider
       partial-sum type) so it adds directly, not to INT4.
-- [ ] Export: `layer1_w.hex`, `layer1_b.hex`, `layer2_w.hex`,
+- [x] Export: `layer1_w.hex`, `layer1_b.hex`, `layer2_w.hex`,
       `layer2_b.hex` in tile-major order matching the loader, + the scale
       shifts. Commit a handful of MNIST test images + expected logits as
       golden vectors.
-- [ ] `netron` sanity-check of the exported graph.
+- [x] `netron` sanity-check of the exported graph (`to_onnx.py`, see Phase 2).
 - [x] Record measured accuracy (float vs INT4) — **2026-09-13: float
       97.70%, INT4 97.23%, delta +0.47pp.** Well inside an acceptable
-      floor for MNIST; see open decision #5.
+      floor for MNIST; see open decision #5. **2026-10-10:** `evaluate.py`
+      also runs all 10k test images through the integer reference model
+      (the thing the RTL is bit-exact against): **97.22%**, disagreeing
+      with the fake-quant float path on 12/10000 images.
+
+Known soft spots, none blocking: the test set doubles as the
+model-selection and calibration set (so 97.2% is slightly optimistic — a
+held-out validation split would fix it, at the cost of new artefacts), and
+`config.FXP` / `refmodel.py` / `export.py` are written for exactly two
+dense layers, mirroring the hardwired `MlpEngine`.
 
 ### Phase 2 — Scala reference model — **DONE (2026-09-08)**
 
@@ -305,7 +318,7 @@ Verilator's Makefile always wraps the compiler with here) will cache-hit
 that step on a repeat run and skip the shim, silently reintroducing the
 bug — so every run needs `CCACHE_DISABLE=1` too:
 ```
-PATH=./.toolshim:$PATH CCACHE_DISABLE=1 sbt "testOnly vmm.mlp.MlpEngineSpec"
+PATH=$PWD/.toolshim:$PATH CCACHE_DISABLE=1 sbt "testOnly vmm.mlp.MlpEngineSpec"
 ```
 See `MlpEngineSpec`'s doc comment for the full detail. Fixing this
 upstream (or pinning a Verilator version without the bug) would remove
@@ -328,43 +341,155 @@ images. Revisit as a throughput item, not correctness.
       parametric variant still open (see below).
 - [x] Full-size (784-64-10) end-to-end on all golden images — all 16 pass
       bit-exact (2026-09-13).
-- [ ] Latency report (cycles/inference) — one data point in hand: ~2188
-      cycles/inference (measured in `MlpEngineSpec`'s passing run), against
-      a rough hand-estimate of ~2192. Still open: a proper writeup, and
-      confirming it's identical across all 16 images (tile counts are
-      image-independent, so it should be — not yet explicitly checked).
+- [x] Latency (cycles/inference) — **2199 cycles** from `start` to
+      `done`, identical for all 16 images (measured by the bring-up
+      harness's `cycles` counter in `sim/tb_mlp_debug.v`, 2026-10-10);
+      ~22 µs at 100 MHz. The earlier ~2188 figure predates the
+      one-compare-per-cycle argmax. The harness reports the same counter
+      on the board.
 - [ ] Small-dim parametric chiseltest variant, if feasible — `MlpEngine`
       is currently hardwired to `MlpConfig`'s fixed 784-64-10 shape, not
       parametric like `VmmParams`.
 
 ### Phase 5 — FPGA bring-up of the MLP
 
-- [ ] `mlp_debug.v` (or extend `vmm_debug.v`): VIO to load an image +
-      trigger, ILA to capture `class` / logits. Weight BRAM initialised
-      from the Phase 1 hex at bitstream build.
-- [ ] Regenerate Verilog (`MainMlp` emission entry), re-run
-      `synth_check` / `timing_check` for the new top — **expect LUT growth**
-      from the accumulators + BRAM; check it still fits xc7z020 and holds
-      100 MHz.
+- [x] **Harness written (2026-10-10)** — `fpga/mlp_debug.v` (VIO + ILA)
+      around `fpga/mlp_debug_core.v`: weights, biases and the 16 golden
+      images are ROMs built from `fpga/mem/*.mem` (`fpga/gen_mlp_mem.py`),
+      loaded into the unchanged `MlpEngine` by a small FSM after reset;
+      each result is checked on-chip against the golden class + logits
+      (`pass_mask`). `sim/tb_mlp_debug.v` passes in Verilator, 16/16.
+      Build: `fpga/build_mlp.tcl`; board procs: `fpga/run_mlp_hw_test.tcl`
+      (not yet run on a device). See `fpga/README.md`.
+      Bitstream builds (full device, PS7 `FCLK_CLK0` 100 MHz, `-max_dsp 0`):
+      WNS +0.164 ns, WHS +0.051 ns, 0 failing; 33.4k LUTs (62.8%), 35
+      block-RAM tiles (25%), 0 DSPs.
+- [x] Regenerate Verilog (`MainMlp` emission entry), re-run
+      `synth_check` / `timing_check` for the new top — **done 2026-10-10**
+      (Vivado 2024.1, OOC, `-max_dsp 0`, reports in `fpga/*MlpEngine*`).
+      First cut (LUTRAM weights, combinational 10-way argmax): 40.6k LUTs
+      post-synth (76.4%), **WNS −14.97 ns**, 23,008 failing endpoints.
+      After moving the weight store to a `SyncReadMem` of packed 128-bit
+      rows read through a sequential pointer, and making argmax one
+      compare per cycle: 34.6k LUTs post-synth (65.0%), 32.7k post-route
+      (61.5%), 7.5 block-RAM tiles, **WNS +0.134 ns**, 0 failing.
+      Superseded later the same day by the `MacBank` cleanup below
+      (30.9k LUTs post-route, WNS +0.168 ns).
+      (The absolute `$PWD/.toolshim` path matters: Verilator's make runs in
+      another directory, so a relative shim path is silently skipped.)
 - [ ] Run on the board via XSCT/Hardware-Manager (see
       `fpga/MANUAL_SETUP.md`), confirm predicted classes on the golden
       images. **This is the first real end-to-end hardware run for the
       whole stack** — the core/controller JTAG flow is still unvalidated
-      on silicon.
+      on silicon. As of 2026-10-12 the harness runs `CimSystem` (Phase 5b),
+      not `MlpEngine`; the VIO/ILA interface and `run_mlp_hw_test.tcl`
+      procs are the same.
 
-### Phase 6 — Bus attachment (parallel track, unblocks A-Core)
+### Phase 5b — TCDM + job-based accelerator — **DONE in simulation (2026-10-12)**
 
-Wraps `VmmController` (or `MlpEngine`), does not change it.
+Pre-bring-up review feedback: separate the VMM from the FSM, use more
+block RAM, put the image and the model parameters in a tightly coupled
+data memory (TCDM) and have the FSM stream from it into the VMM; later the
+FSM goes and a RISC-V core drives the VMM and the TCDM directly. Target:
+`docs/riscv-cim-diagram.pdf` (at 32x32 instead of 64x64).
 
-- [ ] **Decide the bus** — AXI-Lite vs RoCC vs TileLink. Needs A-Core's
-      actual accelerator-attachment interface (from its RTL/docs, not
-      guessed). AXI-Lite is the portable default; RoCC if A-Core exposes a
-      custom-instruction port.
-- [ ] AXI-Lite register map sketch: weight-row write port + push, `a`/image
-      write port, control (`loadStart`/`computeStart`/`imgLoad`), status
-      (`busy`/`done`/`error`), `y`/`class` readback. Bus width drives
-      write serialisation into the wide internal ports.
-- [ ] chiseltest with a small AXI-Lite driver, same golden-model check.
+`MlpEngine` did all of it in one module, so nothing survived removing the
+FSM. The replacement, `src/main/scala/vmm/cim/`:
+
+```
+CimSystem
+├─ Tcdm            4 banks x 2048x32 block RAM, 3-master single-cycle
+│                  interconnect: host port · accelerator · scheduler
+├─ CimAccel        control/status regs + Streamer + PostProc + VmmSequencer;
+│                  runs jobs, knows nothing about the network
+├─ Vmm             the array, now a sibling of the logic that drives it
+└─ MlpScheduler    TEMPORARY: issues the 52 jobs + argmax, i.e. the firmware
+```
+
+- [x] **Array split from its FSM.** `VmmSequencer` is the old
+      `VmmController` FSM with the array behind a port; `VmmController` is
+      kept as `VmmSequencer` + `Vmm` with unchanged IO for the standalone
+      harness and its tests.
+- [x] **TCDM** (`Tcdm.scala`, `src/main/resources/tcdm_bank.v`). 32 kB as
+      in the diagram; needs 27.4 kB: image 400 B, hidden 32 B, logits
+      128 B, biases 384 B, weights 26,624 B. Memory map in `CimMap`.
+      Bank = top address bits; round-robin per bank. The bank is a Verilog
+      black box (byte enables + `$readmemh`).
+- [x] **Job-based accelerator** (`CimAccel.scala`). Registers: `WPtr`,
+      `XPtr`, `BPtr`, `YPtr`, `Mode`, `Shift`, START / status. A job is any
+      of: load a weight tile, clear or bias-preload the accumulators, one
+      pass with accumulate, store INT4 activations (ReLU + round-shift +
+      clamp) or raw sums. The streamer moves one 32-bit word per cycle.
+- [x] **Post-processing** (`PostProc.scala`). The bias is the accumulators'
+      starting value instead of a final add (same integer sum, 20-bit
+      accumulators), and the accumulators are a ring read out one lane at a
+      time, so ReLU / shift / clamp exist once instead of 32 times and the
+      shift is programmable. This removes the old `psumReg -> hiddenReg`
+      critical path.
+- [x] **`MlpScheduler`** writes the registers exactly as firmware will and
+      is the only MLP-specific RTL left. Replacing it with the core means
+      handing over the register port and a TCDM master port.
+- [x] **Verification.** `TcdmSpec` (3), `CimAccelSpec` (1), `CimSystemSpec`
+      (all 16 golden images loaded through the host port; hidden
+      activations, logits and class bit-exact vs `MlpRefModel`). `sbt test`
+      26 green. `sim/tb_mlp_debug.v` on the rewritten harness, TCDM
+      initialised from `fpga/mem/tcdm_bank{0..3}.mem`: 16/16.
+- [x] **Harness** (`fpga/mlp_debug_core.v`): the weight/bias ROMs and the
+      boot loader are gone (the parameters are the TCDM's initial
+      contents); it keeps the 16-image ROM, copies an image in through the
+      host port, starts a run, reads the logits back through the same port
+      and checks them. Ports unchanged, so `mlp_debug.v`'s VIO/ILA are too.
+
+Measured (Vivado 2024.1, `xc7z020clg400-1`, `-max_dsp 0`, 100 MHz,
+out-of-context post-route, `fpga/timing_check_CimSystem_*`):
+
+| | `MlpEngine` | `CimSystem` |
+|---|---|---|
+| LUTs | 30,857 (58.0%) | 27,032 (50.8%) |
+| Registers | 28,023 | 24,140 |
+| Block RAM tiles | 7.5 | 8 (the TCDM) |
+| WNS @ 10 ns | +0.168 ns | +0.640 ns, 0 failing |
+| Cycles / inference | 2199 | 8185 (~82 us) |
+
+The latency cost is the word-serial tile load (128 cycles per tile instead
+of 32); a bank-interleaved 128-bit fetch would recover it and is not
+planned. `CimSystem`'s area includes the TCDM and its interconnect, which
+`MlpEngine`'s figure had no equivalent of (its weights were a private RAM,
+its activations and biases registers).
+
+Full bitstream (`fpga/build_mlp.tcl`, whole device with PS7 clock, VIO and
+ILA, `fpga/mlp_debug_{timing,utilization}.rpt`):
+
+| | `MlpEngine` harness (2026-10-10) | `CimSystem` harness |
+|---|---|---|
+| LUTs | 33,424 (62.8%) | 30,974 (58.2%) |
+| Registers | 31,240 | 28,531 |
+| Block RAM tiles | 35 | 27 |
+| WNS / WHS | +0.164 / +0.051 ns | +0.232 / +0.010 ns, 0 failing |
+
+The first full build of this structure **failed** timing (WNS -0.459 ns, 4
+endpoints) although the out-of-context run had passed at +0.293 ns: the
+activation path (accumulator -> ReLU -> rounding add -> programmable shift
+-> clamp, 22 logic levels) was one cycle. It now has a register after the
+rounding add, at a cost of one cycle per activation store. Worth
+remembering that the OOC check alone is not a signoff for the bitstream.
+
+`MlpEngine.scala`, `MlpEngineSpec` and `MainMlp` are superseded but still
+in the tree (they carry uncommitted changes); delete them once this is
+committed.
+
+### Phase 6 — RISC-V host (replaces "bus attachment")
+
+The two attachment points exist and are exercised (Phase 5b): the TCDM
+host port and the accelerator register port. Remaining, per
+`docs/riscv-cim-diagram.pdf`:
+
+- [ ] Core (RV32IMC, CV32E40P-class) + instruction memory; its OBI data
+      port on the TCDM host port.
+- [ ] APB front end on `CimRegPort`; `done` into an event unit / IRQ.
+- [ ] Firmware that does what `MlpScheduler` does; then delete
+      `MlpScheduler`.
+- [ ] Peripherals (UART first, for results off the board without JTAG).
 
 ### Later / out of scope for now
 
@@ -397,31 +522,65 @@ Wraps `VmmController` (or `MlpEngine`), does not change it.
    Bias adds at psum width (INT13/INT14), not INT4. Layer 2 has no requant
    (argmax is scale-invariant). `.hex`/`scales.json`/`golden.json` already
    committed under this convention (`manifest.json` hashes match).
-4. **Image source on hardware** — JTAG-loaded BRAM vs compiled-in fixed
-   test image vs AXI DMA.
+4. ~~**Image source on hardware**~~ — **decided 2026-10-10:** the 16
+   golden images compiled into a ROM, selected over VIO
+   (`fpga/mlp_debug_core.v`). Weights/biases likewise from ROM, played
+   into `MlpEngine`'s runtime streaming ports.
 5. ~~**Accuracy floor**~~ — **signed off 2026-09-13.** Evaluated the
-   committed checkpoints against the frozen `FXP` above (`test.py`/
-   `train.py:evaluate` on the MNIST test set): float **97.70%**, INT4
+   committed checkpoints against the frozen `FXP` above (`train.py:evaluate`,
+   now `evaluate.py`, on the MNIST test set): float **97.70%**, INT4
    (QAT, weights+activations) **97.23%**, delta **+0.47pp**. Accepted as
    the floor — Phase 3 RTL can proceed against `artifacts/golden.json`.
 
 ---
 
+## `MacBank` fanout + width cleanup — **DONE (2026-10-10)**
+
+Both changes are in `MacBank.scala`, bit-exact (`sbt test`, 21 green, incl.
+`MlpEngineSpec` on all 16 golden images), Verilog regenerated, Vivado
+re-run (2024.1, OOC, `-max_dsp 0`, post-route, reports in `fpga/`).
+
+- [x] **Clock-enable fanout fix.** `prod` and the intermediate adder-tree
+      registers are now free-running (no enable, no reset); only the last
+      level — the one that drives `y` — is still enabled by the `valid`
+      chain, so "`y` holds until the next `aValid`" and the
+      racing-`weightLoad` behaviour are unchanged (both VmmSpec tests
+      pass untouched).
+- [x] **Datapath width trimming.** `prod` is `prodWidth` (8 b) and the
+      tree grows 9, 10, 11, 12, 13.
+
+| | before | after |
+|---|---|---|
+| `MlpEngine` LUTs, post-synth | 34.6k (65.0%) | 32.7k (61.5%) |
+| `MlpEngine` LUTs, post-route | 32.7k (61.5%) | 30.9k (58.0%) |
+| `MlpEngine` WNS @ 10 ns | +0.134 ns | +0.168 ns |
+| `VmmController` LUTs, post-route | 27.9k (52.5%) | 25.4k (47.7%) |
+| `VmmController` registers | 24.0k | 22.9k |
+| `VmmController` WNS @ 10 ns | +0.393 ns | +0.220 ns |
+
+Saving is ~1.8–2.5k LUTs and ~1.1k registers, less than the ~3k / ~5k
+estimate: Vivado was already merging most of the redundant sign-extension
+registers.
+
+**The 10 ns WNS did not move, and is not a measure of margin.** Vivado
+stops working once the constraint is met, so every run lands at
++0.1–0.4 ns with some lazily routed zero-logic net as the "worst" path
+(now weight block RAM → `MacBank` `weightMem`, 7.2 ns of routing, in
+`MlpEngine`; `valid` → `yReg` in `VmmController`). One extra `MlpEngine`
+run constrained to **8 ns** (not saved in `fpga/`) gives the real picture:
+WNS −0.272 ns, 60 failing endpoints, i.e. ≈8.3 ns / ~120 MHz achievable,
+≈1.7 ns of true margin at 100 MHz. The worst path there is real logic in
+`MlpEngine`'s post-tile stage (`psumReg` → `hiddenReg`: bias add + ReLU +
+requant, 13 logic levels), not `MacBank`. No 8 ns run of the old RTL
+exists, so how much of that margin this change bought is not measured.
+
+Not scheduled, for later discussion: bit-serial activations (largest LUT
+lever, ~+7% latency), activation banks into RAM, preloading the
+accumulator with the bias (which would also shorten the post-tile path
+above).
+
 ## Immediate next step
 
-Phases 0, 1, 2 and 3 are all **done**: both blocking Phase 1 decisions
-(#3 fixed-point, #5 accuracy) are signed off, and `MlpEngine` (Phase 3
-RTL) passes end-to-end on all 16 golden images (2026-09-13) — see the
-Phase 3 section's "Status"/"Verification status" notes, including two
-real bugs found and fixed only by actually simulating it.
-
-Next is Phase 4: a latency report (cycle count per inference — already
-have one data point, ~2188 cycles, from the passing run) and a
-small-dim parametric chiseltest variant if feasible. Worth fixing the
-Verilator/GCC PCH bug upstream (or pinning a working Verilator version)
-first, so Phase 4 doesn't depend on the local `.toolshim` + `CCACHE_DISABLE=1`
-workaround. Phase 6 (bus attachment) can start in parallel once the bus
-is chosen.
-
-(Repo is being kept local for now — the `model/` + `src/` trees stay
-untracked by choice, not blocked on anything.)
+Phases 0-5b are done in simulation and through Vivado. Next is the board
+run (Phase 5's open item): program the `mlp_debug` bitstream, `mlp_run_all`,
+expect `pass_mask = FFFF` and 8185 cycles. After that, Phase 6.

@@ -15,3 +15,6 @@ generated/
 
 # per-component scratch docs (convenience only, not part of the repo record)
 docs/
+
+# Vivado project built by fpga/build_mlp.tcl
+fpga/build/

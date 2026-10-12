@@ -8,7 +8,7 @@ here in a few lines.
 Semantics (see config.py for the full convention):
     q      = clamp(round_half_up(x / 2**e), INT4_MIN, INT4_MAX)
     x_hat  = q * 2**e                              # dequantised, for the fwd pass
-    grad   = passes straight through where |x/2**e| was in range, else 0
+    grad   = passes straight through where x/2**e was in [INT4_MIN, INT4_MAX], else 0
 """
 
 from __future__ import annotations
@@ -17,21 +17,6 @@ import numpy as np
 import torch
 
 from config import INT4_MIN, INT4_MAX
-
-
-def choose_pow2_exponent(x: torch.Tensor | np.ndarray, headroom_codes: int = INT4_MAX) -> int:
-    """Smallest integer e such that  max|x| / 2**e  <=  headroom_codes.
-
-    i.e. the tensor's largest magnitude maps to at most `headroom_codes`
-    (default 7 = INT4_MAX, so nothing clamps). Calibration for the per-tensor
-    scale; the result goes into config.FixedPointConfig.
-    """
-    x = torch.as_tensor(x).detach().float()
-    m = float(x.abs().max())
-    if m == 0.0:
-        return -7
-    import math
-    return math.ceil(math.log2(m / headroom_codes))
 
 
 def round_half_up(x: torch.Tensor) -> torch.Tensor:
@@ -43,11 +28,10 @@ def round_half_up(x: torch.Tensor) -> torch.Tensor:
 class _FakeQuant(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, e: int):
-        scale = 2.0 ** e
-        q = torch.clamp(round_half_up(x / scale), INT4_MIN, INT4_MAX)
+        codes = x / 2.0 ** e
         # in-range mask for the STE (clamped values get no gradient)
-        ctx.save_for_backward((q > INT4_MIN) & (q < INT4_MAX) | (x / scale).abs().le(INT4_MAX))
-        return q * scale
+        ctx.save_for_backward((codes >= INT4_MIN) & (codes <= INT4_MAX))
+        return torch.clamp(round_half_up(codes), INT4_MIN, INT4_MAX) * 2.0 ** e
 
     @staticmethod
     def backward(ctx, g):
@@ -86,9 +70,9 @@ def round_shift(x: np.ndarray, s: int) -> np.ndarray:
     if s < 0:
         raise ValueError(f"round_shift needs s >= 0 (got {s}); "
                          "fixed-point exponents make the requant a left shift")
-    if s == 0:
-        return x.astype(np.int64)
     x = x.astype(np.int64)
+    if s == 0:
+        return x
     return (x + (1 << (s - 1))) >> s
 
 

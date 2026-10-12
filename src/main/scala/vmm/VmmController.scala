@@ -3,15 +3,18 @@ package vmm
 import chisel3._
 import chisel3.util._
 
-/** Sequencing FSM around [[Vmm]]: turns the core's low-level, timing-sensitive
+/** Sequencing FSM for [[Vmm]]: turns the core's low-level, timing-sensitive
   * protocol (assert `weightLoad` for exactly `dim` consecutive cycles, one row
   * per cycle; then a single-cycle `aValid` pulse; then wait a fixed
   * `macLatency + 1` cycles for the `yValid` pulse -- see Vmm.scala) into a
   * plain start/busy/done handshake a bus wrapper or a higher-level controller
   * can drive without cycle-counting.
   *
-  * This is the "custom FSM/controller driving this core" the project README
-  * names as the next integration step; it wraps `Vmm` rather than changing it.
+  * The array itself is not instantiated here: it is reached through the
+  * `core` port, so the FSM and the array are separate modules (the array
+  * stands in for the mixed-signal macro of docs/riscv-cim-diagram.pdf, this
+  * FSM is part of the synthesized wrapper around it). [[VmmController]]
+  * below bundles the two back together with the same IO as before.
   *
   * `loadStart` / `computeStart` are rising-edge-detected internally (same as
   * Vmm does for `aValid`), so a source that can only drive a level and not a
@@ -58,7 +61,7 @@ import chisel3.util._
   *                       into `error`; `0` selects the default,
   *                       `p.macLatency + 4`.
   */
-class VmmController(
+class VmmSequencer(
   val p: VmmParams = VmmParams(),
   val loadTimeout: Int = 1024,
   val computeTimeout: Int = 0,
@@ -79,8 +82,7 @@ class VmmController(
     val error = Output(Bool())
     val y     = Output(Vec(p.dim, SInt(p.accWidth.W)))
   })
-
-  val core = Module(new Vmm(p))
+  val core = IO(Flipped(new VmmIO(p)))
 
   val sIdle :: sLoad :: sPulse :: sWait :: Nil = Enum(4)
   val state = RegInit(sIdle)
@@ -104,11 +106,11 @@ class VmmController(
   val computePulse = io.computeStart && !computeStartPrev
 
   // ---- core inputs: safe defaults, overridden per-state below ----
-  core.io.weightLoad    := false.B
-  core.io.weightRow     := rowCtr
-  core.io.weightRowData := io.weightRow.bits
-  core.io.aValid        := false.B
-  core.io.a             := aReg
+  core.weightLoad    := false.B
+  core.weightRow     := rowCtr
+  core.weightRowData := io.weightRow.bits
+  core.aValid        := false.B
+  core.a             := aReg
 
   // ---- controller outputs: defaults ----
   io.weightRow.ready := false.B
@@ -140,9 +142,9 @@ class VmmController(
         rowCtr    := 0.U
         loadStall := 0.U
       }.elsewhen(io.weightRow.fire) {
-        core.io.weightLoad    := true.B
-        core.io.weightRow     := rowCtr
-        core.io.weightRowData := io.weightRow.bits
+        core.weightLoad    := true.B
+        core.weightRow     := rowCtr
+        core.weightRowData := io.weightRow.bits
         rowCtr    := rowCtr + 1.U
         loadStall := 0.U
         when(rowCtr === (p.dim - 1).U) { state := sIdle }
@@ -162,17 +164,17 @@ class VmmController(
       // One-cycle aValid pulse; Vmm edge-detects it into MacBank's start.
       // aReg has settled (latched a cycle earlier in sIdle), so the core
       // samples the right activation vector on this same edge.
-      core.io.aValid := true.B
+      core.aValid := true.B
       waitCtr := 0.U
       state   := sWait
     }
 
     is(sWait) {
       waitCtr := waitCtr + 1.U
-      when(core.io.yValid) {
-        yReg    := core.io.y
+      when(core.yValid) {
+        yReg    := core.y
         io.done := true.B
-        io.y    := core.io.y
+        io.y    := core.y
         state   := sIdle
       }.elsewhen(waitCtr === compTimeout.U) {
         errReg := true.B
@@ -180,4 +182,33 @@ class VmmController(
       }
     }
   }
+}
+
+/** [[VmmSequencer]] plus the [[Vmm]] array it drives, as one module -- the
+  * self-contained top the standalone bring-up flow (fpga/vmm_debug.v,
+  * sim/tb_vmm_controller.v) uses. See [[VmmSequencer]] for the protocol and
+  * the parameters.
+  */
+class VmmController(
+  val p: VmmParams = VmmParams(),
+  val loadTimeout: Int = 1024,
+  val computeTimeout: Int = 0,
+) extends Module {
+  val io = IO(new Bundle {
+    val loadStart = Input(Bool())
+    val weightRow = Flipped(Decoupled(Vec(p.dim, SInt(p.inWidth.W))))
+
+    val computeStart = Input(Bool())
+    val a            = Input(Vec(p.dim, SInt(p.inWidth.W)))
+
+    val busy  = Output(Bool())
+    val done  = Output(Bool())
+    val error = Output(Bool())
+    val y     = Output(Vec(p.dim, SInt(p.accWidth.W)))
+  })
+
+  val seq  = Module(new VmmSequencer(p, loadTimeout, computeTimeout))
+  val core = Module(new Vmm(p))
+  seq.io <> io
+  core.io <> seq.core
 }

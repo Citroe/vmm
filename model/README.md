@@ -8,8 +8,9 @@ See `../PLAN.md` "Phase 1" and open decision #3 (fixed-point convention).
 ```
 train.py  --float-only ─► checkpoints/float.pt        float baseline
 train.py  (float→qat)  ─► checkpoints/qat.pt          INT4 weights + activations (QAT, STE)
-train.py  --calibrate  ─► suggested per-tensor exponents (from real ranges)
+calibrate.py float.pt   ─► MSE-optimal per-tensor exponents (--write patches config.FXP)
 export.py --ckpt qat.pt ─► artifacts/                  .hex + scales.json + golden.json
+evaluate.py             ─► float / QAT / integer-refmodel accuracy on the full test set
 ```
 
 `refmodel.py` is the integer, tiled dataflow (32×32 passes, partial-sum buffer,
@@ -25,7 +26,9 @@ it on `artifacts/golden.json` before any RTL.
 | `quant.py` | hand-rolled fake-quant + STE; integer quantise / `round_shift` / requant |
 | `data.py` | MNIST + pixel normalisation |
 | `model.py` | the 784-64-10 `nn.Module`, float / QAT switch |
-| `train.py` | float + QAT training, accuracy report, activation calibration |
+| `train.py` | float + QAT training, accuracy report |
+| `calibrate.py` | picks the power-of-two exponent per tensor (min quantisation MSE) |
+| `evaluate.py` | accuracy of saved checkpoints: float, QAT, and the integer reference model |
 | `refmodel.py` | integer tiled inference — the Phase 2 contract |
 | `export.py` | `.hex` + `scales.json` + `golden.json` + `manifest.json` |
 | `artifacts/` | **committed** outputs |
@@ -52,7 +55,8 @@ target for the Scala requant and the Verilog datapath.
 The exponents in `config.FXP` are **frozen** (MSE-calibrated via
 `calibrate.py`, committed in `artifacts/scales.json`): `e_act_in=-1, e_w1=-5,
 e_act_hidden=1, e_w2=-3` → `requant_shift=7`. Measured accuracy at this
-convention: float 97.70%, INT4 97.23% (Δ +0.47pp). Re-run
+convention (`evaluate.py`, 10k test images): float 97.70%, QAT 97.23%,
+integer reference model (= what the RTL computes) 97.22%. Re-run
 `calibrate.py --write` only if the float model is retrained.
 
 ## Weight `.hex` layout (loader contract for Phase 3 `WMC`)
@@ -73,8 +77,8 @@ W[row, col] = fc.weight[o·DIM + col, k·DIM + row]        (nn.Linear is out×in
 ```
 pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
 python train.py                              # ~1 min on CPU
-python train.py --calibrate checkpoints/float.pt
-# edit config.FXP exponents if calibration disagrees, then:
+python calibrate.py checkpoints/float.pt     # add --write if the exponents changed
 python train.py --qat-from checkpoints/float.pt
 python export.py --ckpt checkpoints/qat.pt
+python evaluate.py
 ```
