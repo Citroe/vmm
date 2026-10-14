@@ -68,30 +68,49 @@ endpoints; 30,974 LUTs (58.2%), 28,531 registers, 27 block-RAM tiles
 (19%: 8 for the TCDM, the rest mostly the ILA's 4096-sample buffer), 0
 DSPs. The previous `MlpEngine`-based harness was 33,424 LUTs / 35 tiles.
 
-Run on the board:
+Run on the board, in order (paths are as Vivado on Windows sees the WSL
+checkout, `Z:/home/ron/vmm`; adjust for yours):
 
-1. Program `system_wrapper.bit` with its `.ltx`.
-2. Initialise the PS7 over XSCT so `FCLK_CLK0` runs (see "Getting debug
-   cores to show up at all" below). `ps7_init.tcl` is under
-   `fpga/build/mlp_debug/mlp_debug.gen/sources_1/bd/system/ip/system_processing_system7_0_0/`.
-3. In the Hardware Manager Tcl console:
+1. **Vivado Hardware Manager** → Open Target → Program Device, with
+   `fpga/build/mlp_debug/mlp_debug.runs/impl_1/system_wrapper.bit` and the
+   `system_wrapper.ltx` next to it.
+2. **XSCT**, attached to the hw_server Vivado already has open (don't let
+   it start a second one), to initialise the PS7 so `FCLK_CLK0` runs:
    ```tcl
+   connect -url tcp:127.0.0.1:3121
+   targets -set -filter {name =~ "ARM*#0"}
+   rst -processor
+   source {Z:/home/ron/vmm/fpga/build/mlp_debug/mlp_debug.gen/sources_1/bd/system/ip/system_ps7_0_0/ps7_init.tcl}
+   ps7_init
+   ps7_post_config
+   ```
+   Skip this and `FCLK_CLK0` never starts, so Vivado reports "no debug
+   cores" (see "Getting debug cores to show up at all" below). XSCT can
+   stay open; it shares the hw_server.
+3. **Back in Vivado's Tcl console** (not XSCT — the script uses Hardware
+   Manager commands), Refresh Device; `hw_vio` / `hw_ila` should now
+   appear. Then:
+   ```tcl
+   cd Z:/home/ron/vmm
    source fpga/run_mlp_hw_test.tcl
    mlp_run_all     ;# expect: pass_mask = FFFF, "PASS: all 16 golden images match"
    mlp_run 5       ;# one image: class, golden class, label, cycles, logits
    ```
-   By hand in the VIO dashboard: toggle `vio_run_all` 0 → 1 → 0 and read
-   `core_pass_mask` (expect `FFFF`) and `core_error` (expect 0).
+   By hand in the VIO dashboard instead: toggle `vio_run_all` 0 → 1 → 0
+   and read `core_pass_mask` (expect `FFFF`) and `core_error` (expect 0).
 
 VIO and ILA probe maps are documented at the top of `mlp_debug.v`.
 `core_cycles` reports the measured start-to-done latency of the last run
-(8185 cycles in simulation, the same for every image). The ILA's `logits`
+(8185 cycles, the same for every image, in simulation and on the board).
+The ILA's `logits`
 probe is the harness's read-back copy: it updates about 12 cycles after
 `done`, so trigger on `done` with some post-trigger depth to see it.
 
-`run_mlp_hw_test.tcl` has not been run against a device yet; the probe
-names it looks up are the net names in `mlp_debug.v` and may need adjusting
-(the script says how).
+**Validated on the board 2026-10-15** (Pynq-Z2, the 2026-10-12 bitstream
+above, Vivado 2024.1): `mlp_run_all` → `PASS: all 16 golden images match
+(class and all 10 logits)`, and `mlp_run` reports 8185 cycles per
+inference (~82 µs at 100 MHz), matching simulation. The probe names in
+`run_mlp_hw_test.tcl` worked as-is.
 
 ## Build order
 
@@ -271,7 +290,9 @@ window (`arm_dap_0`, alongside the FPGA device `xc7z020_1`):
    <project>.gen/sources_1/bd/<bd_name>/ip/<bd_name>_processing_system7_0_0/ps7_init.tcl
    ```
    (path drifts a bit by Vivado version — search the project folder if
-   neither exists).
+   neither exists). The scripted builds name the PS7 cell `ps7_0`, so the
+   folder is `<bd_name>_ps7_0_0` there, e.g.
+   `fpga/build/mlp_debug/mlp_debug.gen/sources_1/bd/system/ip/system_ps7_0_0/`.
 
 2. **Launch XSCT** and connect to the *same* hw_server Vivado's Hardware
    Manager already opened (don't let it spawn a second one — that

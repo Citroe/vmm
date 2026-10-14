@@ -59,7 +59,9 @@ they add, on top of the text notes, is folded into the sections below:
 
 - Any MLP-level logic (this plan).
 - Bus attachment (AXI-Lite / RoCC / TileLink).
-- Real-hardware end-to-end validation of the JTAG flow.
+- Real-hardware validation of the standalone `VmmController` JTAG harness
+  (`vmm_debug.v`). The full-network `CimSystem` harness passed on the
+  board 2026-10-15 — see Phase 5's board-run item.
 
 ---
 
@@ -351,7 +353,7 @@ images. Revisit as a throughput item, not correctness.
       is currently hardwired to `MlpConfig`'s fixed 784-64-10 shape, not
       parametric like `VmmParams`.
 
-### Phase 5 — FPGA bring-up of the MLP
+### Phase 5 — FPGA bring-up of the MLP — **DONE (2026-10-15)**
 
 - [x] **Harness written (2026-10-10)** — `fpga/mlp_debug.v` (VIO + ILA)
       around `fpga/mlp_debug_core.v`: weights, biases and the 16 golden
@@ -360,7 +362,7 @@ images. Revisit as a throughput item, not correctness.
       each result is checked on-chip against the golden class + logits
       (`pass_mask`). `sim/tb_mlp_debug.v` passes in Verilator, 16/16.
       Build: `fpga/build_mlp.tcl`; board procs: `fpga/run_mlp_hw_test.tcl`
-      (not yet run on a device). See `fpga/README.md`.
+      (passed on the board 2026-10-15). See `fpga/README.md`.
       Bitstream builds (full device, PS7 `FCLK_CLK0` 100 MHz, `-max_dsp 0`):
       WNS +0.164 ns, WHS +0.051 ns, 0 failing; 33.4k LUTs (62.8%), 35
       block-RAM tiles (25%), 0 DSPs.
@@ -377,15 +379,17 @@ images. Revisit as a throughput item, not correctness.
       (30.9k LUTs post-route, WNS +0.168 ns).
       (The absolute `$PWD/.toolshim` path matters: Verilator's make runs in
       another directory, so a relative shim path is silently skipped.)
-- [ ] Run on the board via XSCT/Hardware-Manager (see
-      `fpga/MANUAL_SETUP.md`), confirm predicted classes on the golden
-      images. **This is the first real end-to-end hardware run for the
-      whole stack** — the core/controller JTAG flow is still unvalidated
-      on silicon. As of 2026-10-12 the harness runs `CimSystem` (Phase 5b),
-      not `MlpEngine`; the VIO/ILA interface and `run_mlp_hw_test.tcl`
-      procs are the same.
+- [x] Run on the board via XSCT/Hardware-Manager — **passed 2026-10-15**
+      on a Pynq-Z2 (2026-10-12 `CimSystem` bitstream, Vivado 2024.1;
+      steps in `fpga/README.md`). `mlp_run_all` → `pass_mask = FFFF`, all
+      16 golden images match on class and all 10 logits; `mlp_run`
+      reports 8185 cycles per inference (~82 µs at 100 MHz), the same as
+      simulation. **First real end-to-end hardware run of the whole
+      stack.** The harness runs `CimSystem` (Phase 5b), not `MlpEngine`.
+      The standalone `VmmController` harness (`vmm_debug.v`) has still not
+      been run on silicon.
 
-### Phase 5b — TCDM + job-based accelerator — **DONE in simulation (2026-10-12)**
+### Phase 5b — TCDM + job-based accelerator — **DONE in simulation (2026-10-12), on the board (2026-10-15)**
 
 Pre-bring-up review feedback: separate the VMM from the FSM, use more
 block RAM, put the image and the model parameters in a tightly coupled
