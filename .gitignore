@@ -18,3 +18,23 @@ docs/
 
 # Vivado project built by fpga/build_mlp.tcl
 fpga/build/
+
+# Vivado run/build output and JTAG capture scratch files -- regenerated
+# by build_bd.tcl / create_debug_ip.tcl / run_hw_test.tcl, not source.
+# (Carried over from the old $HOME-rooted repo's .gitignore.)
+*.jou
+*.log
+*.str
+.Xil/
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+*.srcs/
+/vmm_capture.csv
+
+# Claude Code local settings / lock files
+.claude/settings.local.json
+.claude/*.lock
