@@ -20,10 +20,15 @@ object Main extends App {
   * both files to the same Vivado project -- `Vmm`/`MacBank` are defined in
   * each and would collide.
   *
+  * `loadTimeout` is raised from the 1024-cycle default to 2^30 cycles
+  * (~10.7 s at 100 MHz): the JTAG harness feeds one row per VIO commit,
+  * milliseconds apart, which the default would abort after row 0.
+  *
   *   sbt "runMain vmm.MainController --target-dir generated"
   */
 object MainController extends App {
-  (new chisel3.stage.ChiselStage).emitVerilog(new VmmController(VmmParams()), args)
+  (new chisel3.stage.ChiselStage).emitVerilog(
+    new VmmController(VmmParams(), loadTimeout = 1 << 30), args)
 }
 
 /** Emits `MlpEngine.v` -- the Phase 3 tile-scheduler + VmmController/Vmm

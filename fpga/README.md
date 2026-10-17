@@ -112,9 +112,69 @@ above, Vivado 2024.1): `mlp_run_all` → `PASS: all 16 golden images match
 inference (~82 µs at 100 MHz), matching simulation. The probe names in
 `run_mlp_hw_test.tcl` worked as-is.
 
-## Build order
+## Build and run (`vmm_debug`)
 
-With a Vivado project open, targeting the Pynq-Z2:
+One-shot build, from the repo root (same `-max_dsp 0`, 100 MHz
+`FCLK_CLK0` as the MLP harness):
+
+```
+sbt "runMain vmm.MainController --target-dir generated"   # VmmController.v
+vivado -mode batch -source fpga/build_vmm.tcl
+```
+
+This writes `fpga/build/vmm_debug/vmm_debug.runs/impl_1/system_wrapper.bit`
+(+ `.ltx`) and `fpga/vmm_debug_{timing,utilization}.rpt`.
+
+Last build (2026-10-15, Vivado 2024.1, full device with the real
+`FCLK_CLK0` clock): timing met, WNS +0.559 ns, WHS +0.024 ns, 0 failing
+endpoints; 30,857 LUTs (58.0%), 29,534 registers, 12 block-RAM tiles, 0
+DSPs.
+
+**Board run: PASSED (2026-10-17).** `vmm_selftest` on the Pynq-Z2 with the
+bitstream above printed `PASS: all 3 matrices match a^T*W`: the mixed
+pattern (`y[0..2] = -2 82 -104`) and both corners (`+2048`, `-1792` in all
+32 lanes), with `error` clear and about a second per matrix. Before touching
+the board, `sim/tb_vmm_debug.v` runs the whole harness (VIO/ILA stubbed)
+the way `run_hw_test.tcl` drives it — see its header for the Verilator
+command.
+
+`MainController` emits `VmmController` with `loadTimeout = 2^30` cycles
+(~10.7 s at 100 MHz) instead of the 1024-cycle default. Over JTAG each row
+is its own VIO commit, milliseconds apart, so the default aborted every
+load after row 0 (`error` set, the remaining rows ignored);
+`tb_vmm_debug` fails exactly that way against a 1024-cycle build.
+
+Run on the board, in order:
+
+1. **Vivado Hardware Manager** → Open Target → Program Device, with
+   `fpga/build/vmm_debug/vmm_debug.runs/impl_1/system_wrapper.bit` and the
+   `system_wrapper.ltx` next to it.
+2. **XSCT**, attached to Vivado's hw_server, to start `FCLK_CLK0`:
+   ```tcl
+   connect -url tcp:127.0.0.1:3121
+   targets -set -filter {name =~ "ARM*#0"}
+   rst -processor
+   source {Z:/home/ron/vmm/fpga/build/vmm_debug/vmm_debug.gen/sources_1/bd/system/ip/system_ps7_0_0/ps7_init.tcl}
+   ps7_init
+   ps7_post_config
+   ```
+3. **Back in Vivado's Tcl console** (not XSCT), Refresh Device; `hw_vio` /
+   `hw_ila` should now appear. Then:
+   ```tcl
+   cd Z:/home/ron/vmm
+   source fpga/run_hw_test.tcl
+   vmm_selftest    ;# expect: "PASS: all 3 matrices match a^T*W"
+   ```
+
+`vmm_selftest` loads three matrices — a mixed pattern and the two
+full-scale corners (`-8 × -8` → `+2048`, `7 × -8` → `-1792` in every lane)
+— and checks each `y` against `a^T·W` computed in Tcl. Each load is 64 VIO
+commits, so a pass takes a few seconds. See "Driving a test" below for
+`vmm_run` with your own matrices.
+
+### Manual build order
+
+The same build by hand, with a Vivado project open targeting the Pynq-Z2:
 
 ```tcl
 add_files generated/VmmController.v fpga/vmm_debug.v
@@ -362,29 +422,34 @@ Handshake (see `src/main/scala/vmm/VmmController.scala`):
    and held from that point until the next pass. `vio_error` / ILA
    `probe3` go high if the pass starts but `yValid` never arrives.
 
+By hand, each row has to arrive within the ~10.7 s load-stall timeout of
+the previous one; past that `error` latches and the FSM drops back to
+idle — toggle `vio_loadStart` again to restart the load from row 0.
+
 Doing the 32-row weight load by hand through the VIO GUI is tedious.
 `fpga/run_hw_test.tcl` automates all of the above from the Hardware
-Manager Tcl console — arms the ILA, drives a full weight matrix + vector
-over JTAG via `commit_hw_vio`, waits for the trigger, and decodes/prints
-all 32 `y` lanes from the captured data:
+Manager Tcl console — drives a full weight matrix + vector over JTAG via
+`commit_hw_vio`, arms the ILA, waits for the trigger, decodes all 32 `y`
+lanes from the captured data, and checks them against `a^T·W`:
 
 ```tcl
 source fpga/run_hw_test.tcl
-set W [lrepeat 32 [lrepeat 32 0]]        ;# 32x32 zero matrix to start
-lset W 0 [lreplace [lindex $W 0] 0 0 5]  ;# W[row 0][col 0] = 5
+vmm_selftest                             ;# 3 built-in matrices, PASS/FAIL
+set W [lrepeat 32 [lrepeat 32 0]]        ;# or your own: 32x32 zero matrix
+lset W 0 0 5                             ;# W[row 0][col 0] = 5
 set A [lrepeat 32 0]
 lset A 0 3                               ;# a[0] = 3
-vmm_run $W $A                            ;# arms, drives, waits, prints y
+vmm_run $W $A                            ;# prints y, flags lanes != a^T*W
 ```
 
-Not yet validated against a live device end-to-end — the hw_probe names
-it assumes (`vio_loadStart`, `dut_y`, etc., matching the net names in
-`vmm_debug.v`) and the CSV column/radix format it parses out of
-`write_hw_ila_data` can both vary by Vivado version. If it errors out on
-first run, check `get_hw_probes -of_objects [get_hw_vios hw_vio_1]` /
-`[get_hw_ilas hw_ila_1]` against the names configured at the top of the
-script, and check the exported `vmm_capture.csv` matches what
-`vmm_decode_y` expects to parse.
+The script finds the VIO / ILA on the current device rather than by name,
+and accepts each probe under its net name or with Vivado's `_1` suffix: a
+net wired to both cores (`dut_done`, `dut_busy`, `dut_error`,
+`vio_computeStart`) shows up as `<net>_1` on the ILA, as the August
+`vmm_capture.csv` shows. `y` comes from the last row of the ILA's
+`write_hw_ila_data` CSV (`.../dut_y[415:0]`, HEX). Run against the
+dim=32 build on the Pynq-Z2 on 2026-10-17 (`vmm_selftest` passed); if
+a probe lookup fails, the error lists the probes the core actually has.
 
 ### Resolved: current dim=32/INT4 design meets timing at 100MHz
 

@@ -242,17 +242,18 @@ From the **Hardware Manager Tcl Console**:
 
 ```tcl
 source fpga/run_hw_test.tcl
-set W [lrepeat 32 [lrepeat 32 0]]        ;# 32x32 zero matrix
-lset W 0 [lreplace [lindex $W 0] 0 0 5]  ;# W[row 0][col 0] = 5
+vmm_selftest                             ;# 3 built-in matrices, PASS/FAIL
+set W [lrepeat 32 [lrepeat 32 0]]        ;# or your own: 32x32 zero matrix
+lset W 0 0 5                             ;# W[row 0][col 0] = 5
 set A [lrepeat 32 0]
 lset A 0 3                               ;# a[0] = 3
-vmm_run $W $A                            ;# arms ILA, drives, waits, prints y
+vmm_run $W $A                            ;# drives, captures, checks, prints y
 ```
 
-Expected: `y[0] = 15` (`a[0]*W[0][0] = 3*5`), all other lanes `0`.
-`vmm_run` arms the ILA on `done`, pulses `loadStart`, streams the 32 rows,
-pulses `computeStart`, waits for the trigger, and decodes all 32 `y` lanes
-from the capture. `vmm_status` prints the VIO readbacks
+Expected for the hand-made one: `y[0] = 15` (`a[0]*W[0][0] = 3*5`), all
+other lanes `0`, and `match`. `vmm_run` pulses `loadStart`, streams the 32
+rows, arms the ILA on `done`, pulses `computeStart`, waits for the trigger,
+decodes all 32 `y` lanes from the capture and compares them with `a^T·W`. `vmm_status` prints the VIO readbacks
 (`weightRow.ready` / `busy` / `done` / `error`) if you want to watch
 progress.
 
@@ -273,6 +274,9 @@ progress.
      FSM addresses rows itself). Do the first `loadStart` **1 → 0** toggle
      once, before the first row.
    - watch `dut_busy` = 1 during the load, back to 0 after row 31.
+   - each row must follow the previous one within ~10.7 s (the load-stall
+     timeout `MainController` builds in); otherwise `dut_error` goes to 1 and
+     the load aborts — toggle `vio_loadStart` again to restart from row 0.
 4. **Compute.** Set `vio_a` = packed activation vector, toggle
    `vio_computeStart` **1 → 0**.
 5. The ILA triggers on `done`. **Hardware → hw_ila_1 → Waveform:** read

@@ -302,4 +302,5 @@ Remaining, per `docs/riscv-cim-diagram.pdf`: the core itself with its
 instruction memory, an APB front end on the register port, the event unit
 (`done` as an interrupt), and the peripherals. `VmmController` remains the
 self-contained array + sequencer for the standalone JTAG harness
-(`fpga/vmm_debug.v`).
+(`fpga/vmm_debug.v`); that harness is built and timing-clean, and it
+passed on the board 2026-10-17 (see `fpga/README.md`).

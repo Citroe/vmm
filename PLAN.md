@@ -59,9 +59,6 @@ they add, on top of the text notes, is folded into the sections below:
 
 - Any MLP-level logic (this plan).
 - Bus attachment (AXI-Lite / RoCC / TileLink).
-- Real-hardware validation of the standalone `VmmController` JTAG harness
-  (`vmm_debug.v`). The full-network `CimSystem` harness passed on the
-  board 2026-10-15 — see Phase 5's board-run item.
 
 ---
 
@@ -353,7 +350,7 @@ images. Revisit as a throughput item, not correctness.
       is currently hardwired to `MlpConfig`'s fixed 784-64-10 shape, not
       parametric like `VmmParams`.
 
-### Phase 5 — FPGA bring-up of the MLP — **DONE (2026-10-15)**
+### Phase 5 — FPGA bring-up of the MLP — **DONE (MLP 2026-10-15, standalone `VmmController` 2026-10-17)**
 
 - [x] **Harness written (2026-10-10)** — `fpga/mlp_debug.v` (VIO + ILA)
       around `fpga/mlp_debug_core.v`: weights, biases and the 16 golden
@@ -386,8 +383,29 @@ images. Revisit as a throughput item, not correctness.
       reports 8185 cycles per inference (~82 µs at 100 MHz), the same as
       simulation. **First real end-to-end hardware run of the whole
       stack.** The harness runs `CimSystem` (Phase 5b), not `MlpEngine`.
-      The standalone `VmmController` harness (`vmm_debug.v`) has still not
-      been run on silicon.
+- [x] **Standalone `VmmController` harness on the board — PASSED
+      (2026-10-17).** `vmm_selftest` printed `PASS: all 3 matrices match
+      a^T*W` (mixed `y[0..2] = -2 82 -104`; corners `+2048` / `-1792` in
+      all lanes; `error` clear). First silicon run of this harness.
+      Prepared 2026-10-15:
+      - Fixed a bring-up blocker: the Phase-0 load-stall timeout (1024
+        cycles, ~10 µs) aborted every JTAG weight load after row 0, since
+        VIO commits arrive milliseconds apart. `MainController` now emits
+        `VmmController` with `loadTimeout = 2^30` (~10.7 s).
+      - `sim/tb_vmm_debug.v`: whole harness (VIO/ILA stubbed) at
+        JTAG-speed row gaps — passes (mixed pattern, `+2048` / `-1792`
+        corners); fails after row 0 against a 1024-cycle build.
+      - `fpga/run_hw_test.tcl` reworked: finds the VIO/ILA on the device,
+        accepts Vivado's `_1` ILA probe names (the new `.ltx` confirms the
+        trigger is `dut_done_1`), checks `y` against `a^T·W`, adds
+        `vmm_selftest`. Exercised only against a mocked Hardware Manager.
+      - `fpga/build_vmm.tcl` one-shot build: bitstream at
+        `fpga/build/vmm_debug/vmm_debug.runs/impl_1/system_wrapper.bit`;
+        timing met at 100 MHz, WNS +0.559 ns, WHS +0.024 ns, 0 failing;
+        30.9k LUTs (58%), 12 BRAM tiles, 0 DSPs.
+      - Run 2026-10-17 with the `fpga/README.md` steps (program,
+        `ps7_init` in XSCT, `vmm_selftest`), driven in Vivado/XSCT batch
+        mode, unchanged from how they're written there.
 
 ### Phase 5b — TCDM + job-based accelerator — **DONE in simulation (2026-10-12), on the board (2026-10-15)**
 
